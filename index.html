@@ -1,0 +1,1788 @@
+<!DOCTYPE html>
+<html lang="en-us">
+<head>
+<script>
+(function () {
+    var realNow = performance.now.bind(performance);
+    window.__l67RealNow = realNow;                 // un-scaled clock (for the FPS counter)
+    var speed = 1, realBase = realNow(), virtBase = realBase;
+    function virtNow() { return virtBase + (realNow() - realBase) * speed; }
+    performance.now = virtNow;
+    var raf = window.requestAnimationFrame.bind(window);
+    function runFrame(cb) {
+        cb(virtNow());
+        if (window.__l67AfterFrame) { try { window.__l67AfterFrame(); } catch (e) {} }
+    }
+    var next = null;
+    window.requestAnimationFrame = function (cb) {
+        var token = { cb: cb, done: false };
+        next = token;
+        return raf(function () { if (token.done) return; token.done = true; runFrame(cb); });
+    };
+
+    // Click Between Frames: the game only looks at input once per frame, so a click lands on the
+    // next frame boundary. With CBF on, the moment you press or release, the game is advanced to
+    // that exact instant *before* it sees the input, so the input takes effect when you actually
+    // clicked instead of up to a frame later. (Unity queues the next frame right away, so there is
+    // always one waiting to be run early.)
+    var lastEarly = 0;
+    function cbf(e) {
+        if (!window.__l67Cbf || !window.__l67InLevelNow) return;
+        if (e.type.indexOf('key') === 0) {
+            if (e.repeat || !(e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW')) return;
+        } else if (e.button !== undefined && e.button !== 0) return;
+        else if (e.target && e.target.id && e.target.id !== 'unity-canvas') return;
+        var t = realNow();
+        if (t - lastEarly < 2 || !next || next.done) return;   // never more than one early frame per 2 ms
+        lastEarly = t;
+        next.done = true;
+        runFrame(next.cb);
+    }
+    ['keydown', 'keyup', 'mousedown', 'mouseup', 'touchstart', 'touchend'].forEach(function (type) {
+        window.addEventListener(type, cbf, { capture: true, passive: true });
+    });
+    window.__setGameSpeed = function (s) {
+        virtBase = virtNow(); realBase = realNow(); speed = s;
+        if (window.__l67SyncMusic) window.__l67SyncMusic();
+    };
+    window.__getGameSpeed = function () { return speed; };
+})();
+
+// Force English: the game picks Russian when it can't match the browser language (e.g. "en-US").
+(function () {
+    try {
+        Object.defineProperty(Navigator.prototype, 'language',  { get: function () { return 'en'; }, configurable: true });
+        Object.defineProperty(Navigator.prototype, 'languages', { get: function () { return ['en']; }, configurable: true });
+    } catch (e) {}
+})();
+
+// ---- Game code patch: auto-retry ----
+// In WaveController.Update the game does:
+//     if (waitingForInput && !PauseManager.isPaused && IsWaveInputPressed()) { waitingForInput = false; ...start run... }
+// We redirect that single IsWaveInputPressed() call to window.__l67StartCheck(thisPtr), which still reads the
+// real input but can also say "go" on its own after a death. The call goes through an import the game never
+// uses (__syscall_symlink), tagged with a -1 argument so it can't be confused with a real call.
+(function () {
+    var SITE = 0xE544E4;                                         // file offset in the merged .wasm
+    var ORIG = [0x20,0x00, 0x20,0x00, 0x10,0x8D,0xDC,0x02];     // local.get 0; local.get 0; call 44557
+    var NEW_ = [0x20,0x00, 0x41,0x7F, 0x10,0x4A, 0x01,0x01];     // local.get 0; i32.const -1; call 74; nop; nop
+    window.__patchGameWasm = function (bytes) {
+        for (var i = 0; i < ORIG.length; i++) if (bytes[SITE + i] !== ORIG[i]) {
+            console.warn('[auto-retry] game code did not match, patch skipped'); return;
+        }
+        bytes.set(NEW_, SITE);
+        window.__l67Patched = true;
+
+        // Every WaveController.Die(...) call (spike/hazard touch, out of bounds, dual-clone death) is
+        // redirected to window.__l67Die so noclip can skip it and stats can count it. Each site is
+        // "local.get mi; call 44512" -> "i32.const -1; call 45 (_tzset_js, only used once at startup)".
+        // The practice-toggle restart is left alone on purpose.
+        var DIE_SITES = [0xE4D7DA, 0xE51C12, 0xE56B9D, 0xE576AA], ok = 0;
+        DIE_SITES.forEach(function (at) {
+            if (bytes[at] !== 0x20 || bytes[at + 2] !== 0x10 || bytes[at + 3] !== 0xE0 ||
+                bytes[at + 4] !== 0xDB || bytes[at + 5] !== 0x02) return;
+            bytes.set([0x41, 0x7F, 0x10, 0x2D, 0x01, 0x01], at); ok++;
+        });
+        // the dual-mode clone has its own Die(); route it the same way, tagged -2
+        var CLONE_SITES = [0xE4CF0C, 0xE4E9EB];
+        CLONE_SITES.forEach(function (at) {
+            if (bytes[at] !== 0x20 || bytes[at + 2] !== 0x10 || bytes[at + 3] !== 0xDE ||
+                bytes[at + 4] !== 0xDB || bytes[at + 5] !== 0x02) return;
+            bytes.set([0x41, 0x7E, 0x10, 0x2D, 0x01, 0x01], at); ok++;
+        });
+        // OnCollisionStay2D: "if (other.CompareTag("Ground")) isOnGround = true" -> CompareTag goes through
+        // gethostbyaddr (never used in a browser game), tagged -3, so noclip can say "not ground" while
+        // you're inside blocks. Otherwise the wave thinks it is sliding on the floor and flies flat.
+        var GROUND_SITE = 0xE5750E;
+        if (bytes[GROUND_SITE] === 0x41 && bytes[GROUND_SITE + 1] === 0x00 && bytes[GROUND_SITE + 2] === 0x10 &&
+            bytes[GROUND_SITE + 3] === 0xB5 && bytes[GROUND_SITE + 4] === 0xA8 && bytes[GROUND_SITE + 5] === 0x05) {
+            bytes.set([0x41, 0x7D, 0x10, 0xFE, 0x01, 0x01], GROUND_SITE);
+            window.__l67GroundPatched = true;
+        }
+        window.__l67DiePatched = ok === DIE_SITES.length + CLONE_SITES.length;
+        if (!window.__l67DiePatched) console.warn('[noclip] only ' + ok + ' death checks patched');
+    };
+
+    window.__l67 = { exports: null };
+
+    // "Is a level being played?" Normal levels set CameraSliderControl.playing (class 7026040, static +29)
+    // in StartLevel and clear it on Stop/Menu; editor test-play sets GameManager.isGameMode (7027952, +0).
+    window.__l67InLevel = function (buf) {
+        var u32 = new Uint32Array(buf), u8 = new Uint8Array(buf);
+        function flag(cls, off) { var c = u32[cls >> 2], st = c ? u32[(c + 92) >> 2] : 0; return st ? u8[st + off] === 1 : false; }
+        return flag(7026040, 29) || flag(7027952, 0);
+    };
+    function wrapImports(imports) {
+        var env = imports && imports.env;
+        if (!env || typeof env.__syscall_symlink !== 'function' || env.__l67) return;
+        var orig = env.__syscall_symlink;
+        env.__syscall_symlink = function (a, b) {
+            if (b === -1 && window.__l67StartCheck) return window.__l67StartCheck(a) ? 1 : 0;
+            return orig(a, b);
+        };
+        var gh = env.gethostbyaddr;
+        env.gethostbyaddr = function (a, b, c) {
+            if (c === -3) {
+                if (window.__l67Noclip) return 0;     // noclip: never "standing on ground"
+                return window.__l67.exports.__indirect_function_table.get(0x1F2D)(a, b, 0);   // GameObject.CompareTag
+            }
+            return gh(a, b, c);
+        };
+        var tz = env._tzset_js;
+        env._tzset_js = function (a, b, c) {
+            if (c === -1) { if (window.__l67Die) window.__l67Die(a, b); return; }
+            if (c === -2) { if (window.__l67CloneDie) window.__l67CloneDie(a, b); return; }
+            return tz(a, b, c);
+        };
+        env.__l67 = true;
+    }
+    function keep(result) {
+        var inst = result && (result.instance || result);
+        if (inst && inst.exports && inst.exports.__indirect_function_table) window.__l67.exports = inst.exports;
+        return result;
+    }
+    var inst = WebAssembly.instantiate;
+    WebAssembly.instantiate = function (src, imports) { wrapImports(imports); return inst.apply(this, arguments).then(keep); };
+    if (WebAssembly.instantiateStreaming) {
+        var instS = WebAssembly.instantiateStreaming;
+        WebAssembly.instantiateStreaming = function (src, imports) { wrapImports(imports); return instS.apply(this, arguments).then(keep); };
+    }
+})();
+
+// Report every sound the game starts, so the page can tell when you die / when a run starts.
+(function () {
+    if (!window.AudioBufferSourceNode) return;
+    var start = AudioBufferSourceNode.prototype.start;
+    var music = new Set();
+    function musicRate() {
+        return window.__l67MusicFollow && window.__getGameSpeed ? window.__getGameSpeed() : 1;
+    }
+    // Unity tracks song position from playbackRate, so we change speed through its own setPitch.
+    // (This game never changes the music's pitch itself, so the rate is simply 1 or the game speed.)
+    function adopt(node) {
+        if (node.__l67 || typeof node.setPitch !== 'function') return;
+        var orig = node.setPitch;
+        node.setPitch = function () { return orig.call(node, musicRate()); };
+        node.__l67 = true;
+        music.add(node);
+        node.addEventListener('ended', function () { music.delete(node); });
+    }
+    window.__l67SyncMusic = function () {
+        music.forEach(function (n) { try { n.setPitch(); } catch (e) { music.delete(n); } });
+    };
+    AudioBufferSourceNode.prototype.start = function () {
+        try { if (this.buffer && this.buffer.duration > 20) adopt(this); } catch (e) {}
+        try {
+            if (this.buffer) window.dispatchEvent(new CustomEvent('l67-sound', { detail: this.buffer.duration }));
+        } catch (e) {}
+        return start.apply(this, arguments);
+    };
+})();
+</script>
+
+<meta charset="utf-8"/>
+<title>Level 67</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no"/>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nxd-s6-3@1.0.0/style.css"/>
+<style>
+    canvas:focus { outline: none; }
+    html, body {
+        padding: 0; margin: 0; overflow: hidden;
+        overscroll-behavior: none;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        -webkit-tap-highlight-color: rgba(0,0,0,0);
+        height: 100%; min-height: 100%;
+        height: 100vh; min-height: 100vh;
+        position: fixed; left: 0; top: 0; right: 0; bottom: 0;
+        touch-action: none; width: 100%;
+        -webkit-overflow-scrolling: auto;
+    }
+    #unity-container, #loading-cover {
+        overflow: hidden;
+        touch-action: none;
+    }
+</style>
+</head>
+<script>
+window.addEventListener('error', function (e) {
+    var d = document.getElementById('err-box') || document.body.appendChild(Object.assign(document.createElement('pre'), {id: 'err-box'}));
+    d.style.cssText = 'position:fixed;left:8px;right:8px;bottom:8px;margin:0;padding:8px;background:#222;color:#fff;font:12px monospace;white-space:pre-wrap;z-index:99999';
+    d.textContent = 'Error: ' + (e.message || e) + (e.filename ? '\n' + e.filename + ':' + e.lineno : '');
+});
+</script>
+<body class="dark" style="background: rgb(0,0,0);">
+
+<div id="unity-container" class="unity-desktop">
+    <canvas id="unity-canvas" tabindex="-1"></canvas>
+</div>
+
+<div id="loading-cover" style="display:none;">
+    <div id="unity-loading-bar">
+        <div id="unity-logo">
+            <img src="https://cdn.jsdelivr.net/npm/nxd-s6-3@1.0.0/logo.gif"/>
+        </div>
+        <div id="unity-progress-bar-empty" style="display:none;">
+            <div id="unity-progress-bar-full"></div>
+        </div>
+        <div class="spinner"></div>
+    </div>
+</div>
+
+<script>
+const CDN1 = "https://cdn.jsdelivr.net/npm/nxd-s6-1@1.0.0/";
+const CDN2 = "https://cdn.jsdelivr.net/npm/nxd-s6-2@1.0.0/";
+const CDN3 = "https://cdn.jsdelivr.net/npm/nxd-s6-3@1.0.0/";
+
+const DATA_URLS = [
+    CDN1 + "att49.data.part0.js",
+    CDN1 + "att49.data.part1.js",
+    CDN1 + "att49.data.part2.js",
+    CDN1 + "att49.data.part3.js",
+    CDN1 + "att49.data.part4.js",
+    CDN1 + "att49.data.part5.js",
+    CDN2 + "att49.data.part6.js",
+    CDN2 + "att49.data.part7.js"
+];
+
+const WASM_URLS = [
+    CDN2 + "att49.wasm.part0.js",
+    CDN2 + "att49.wasm.part1.js",
+    CDN2 + "att49.wasm.part2.js",
+    CDN2 + "att49.wasm.part3.js",
+    CDN3 + "att49.wasm.part4.js",
+    CDN3 + "att49.wasm.part5.js"
+];
+
+const FRAMEWORK_URL = CDN3 + "att49.framework.js";
+const LOADER_URL    = CDN3 + "att49.loader.js";
+
+const NO_DATA = 'no data';
+
+var initYSDK      = true;
+var initGame      = false;
+var isVisibility  = true;
+var isPausedGame  = false;
+var nowFullAdOpen = false;
+
+var cloudSaves      = NO_DATA;
+var environmentData = JSON.stringify({ language:'en', domain:'com', deviceType:'desktop', isMobile:false, isDesktop:true, isTablet:false, isTV:false, appID:'0', browserLang:'en', payload:'', platform:'', browser:'Other' });
+var playerData      = NO_DATA;
+var statsSaves      = NO_DATA;
+var paymentsData    = NO_DATA;
+var allGamesData    = NO_DATA;
+var flasgsData      = NO_DATA;
+
+var player   = null;
+var payments = null;
+
+let ygGameInstance = null;
+
+var ysdk = {
+    environment: {
+        i18n:    { lang: 'en', tld: 'com' },
+        app:     { id: '0' },
+        browser: { lang: 'en' },
+        payload: ''
+    },
+    deviceInfo: {
+        type:      'desktop',
+        isMobile:  () => false,
+        isDesktop: () => true,
+        isTablet:  () => false,
+        isTV:      () => false,
+    },
+    screen: { fullscreen: { status: 'off', request: ()=>{}, exit: ()=>{} } },
+    adv: {
+        showFullscreenAdv:  (o) => { o?.callbacks?.onOpen?.(); setTimeout(()=>{ o?.callbacks?.onClose?.(true); }, 50); },
+        showRewardedVideo:  (o) => { o?.callbacks?.onOpen?.(); setTimeout(()=>{ o?.callbacks?.onRewarded?.(); o?.callbacks?.onClose?.(); }, 50); },
+        showBannerAdv:      () => Promise.resolve({ stickyAdvIsShowing: false }),
+        hideBannerAdv:      () => Promise.resolve(),
+        getBannerAdvStatus: () => Promise.resolve({ stickyAdvIsShowing: false }),
+    },
+    auth:     { openAuthDialog: () => Promise.resolve() },
+    features: {
+        LoadingAPI:  { ready: () => {} },
+        GameplayAPI: { start: () => {}, stop: () => {} },
+        GamesAPI:    { getAllGames: () => Promise.reject(new Error('not available')) },
+    },
+    leaderboards: {
+        getDescription: () => Promise.resolve({ default: false, description: { invert_sort_order: false, score_format: { options: { decimal_offset: 0 } }, type: 'numeric' } }),
+        getEntries:     () => Promise.resolve({ entries: [] }),
+        setScore:       () => {},
+    },
+    getPlayer: () => Promise.resolve({
+        isAuthorized:    () => false,
+        getName:         () => '',
+        getUniqueID:     () => 'unauthorized',
+        getPhoto:        () => 'no data',
+        getPayingStatus: () => 'unknown',
+        getData:         () => Promise.resolve({}),
+        setData:         () => Promise.resolve(),
+        getStats:        () => Promise.resolve({}),
+        setStats:        () => Promise.resolve(),
+        incrementStats:  () => Promise.resolve(),
+    }),
+    getPayments: () => Promise.reject(new Error('payments not available')),
+    getFlags:    () => Promise.resolve({}),
+    serverTime: () => Date.now(),
+    on: () => {},
+};
+
+function YG2Instance(method, arg) {
+    if (!ygGameInstance) return;
+    try {
+        if (arg !== undefined) ygGameInstance.SendMessage('YG2Instance', method, arg);
+        else                   ygGameInstance.SendMessage('YG2Instance', method);
+    } catch(e) {}
+}
+
+function LogStyledMessage(msg, style) {
+    console.log('%c' + msg, style || 'color:#FFDF73;background:#454545');
+}
+function FocusGame() { if (!isPausedGame) canvas.focus(); }
+function InitGame()  {
+    initGame = true;
+    setTimeout(() => { if (isPausedGame) YG2Instance('SetPauseGame', 'true'); }, 100);
+}
+function SetVisibility(visibility) {
+    if (initGame && isVisibility !== visibility) {
+        isVisibility = visibility;
+        YG2Instance('SetFocusWindowGame', visibility ? 'true' : 'false');
+    }
+}
+
+const DEFAULT_SAVE = JSON.stringify([JSON.stringify({ collectedStars: [] })]);
+
+function SaveCloud()  {}
+function LoadCloud()  {
+    cloudSaves = DEFAULT_SAVE;
+    YG2Instance('SetLoadSaves', DEFAULT_SAVE);
+    return Promise.resolve(DEFAULT_SAVE);
+}
+
+function RewardedAdvShow(id) {
+    YG2Instance('OpenRewardedAdv');
+    setTimeout(() => {
+        YG2Instance('RewardAdv', id);
+        setTimeout(() => {
+            YG2Instance('CloseRewardedAdv');
+            setTimeout(() => { FocusGame(); }, 100);
+        }, 300);
+    }, 500);
+}
+
+function InterAdvShow() {
+    YG2Instance('OpenInterAdv');
+    setTimeout(() => { YG2Instance('CloseInterAdv', 'true'); FocusGame(); }, 50);
+}
+
+function GetStats() {
+    YG2Instance('ReceiveStats', NO_DATA);
+    return Promise.resolve(NO_DATA);
+}
+function SetStats() {}
+
+function InitPayments()     { YG2Instance('PaymentsEntries', NO_DATA); return Promise.resolve(NO_DATA); }
+function BuyPayments(id)    { YG2Instance('OnPurchaseFailed', id); FocusGame(); }
+function ConsumePurchase()  {}
+function ConsumePurchases() {}
+
+function GetAllGames() { return Promise.resolve(NO_DATA); }
+
+function SetLeaderboard()   {}
+function GetLeaderboard(nameLB) {
+    YG2Instance('LeaderboardEntries', JSON.stringify({
+        technoName: nameLB, isDefault: false, isInvertSortOrder: false,
+        decimalOffset: 0, type: 'numeric',
+        entries: 'no data', ranks: [], photos: [], names: [], scores: [], uniqueIDs: [], extraDataArray: []
+    }));
+}
+function EntriesLB() { return {}; }
+
+function GetFlags() {
+    const j = JSON.stringify({ names: [], values: [] });
+    flasgsData = j;
+    return Promise.resolve(j);
+}
+
+function NotAuthorized() {
+    return JSON.stringify({
+        playerAuth: 'rejected', playerName: 'unauthorized',
+        playerId: 'unauthorized', playerPhoto: 'no data', payingStatus: 'unknown'
+    });
+}
+function InitPlayer() {
+    const j = NotAuthorized();
+    YG2Instance('SetAuth', j);
+    return Promise.resolve(j);
+}
+function OpenAuthDialog() {}
+
+function RequestingEnvironmentData() {
+    const j = JSON.stringify({
+        language:'en', domain:'com', deviceType:'desktop',
+        isMobile:false, isDesktop:true, isTablet:false, isTV:false,
+        appID:'0', browserLang:'en', payload:'', platform:'', browser:'Other'
+    });
+    environmentData = j;
+    YG2Instance('SetEnvirData', j);
+    return Promise.resolve(j);
+}
+
+const oRequestPointerLock = Element.prototype.requestPointerLock;
+Element.prototype.requestPointerLock = async function(...args) {
+    try { (args[0] ||= {}).unadjustedMovement = true; await oRequestPointerLock.apply(this, args); } catch(e) {}
+};
+
+const container = document.querySelector("#unity-container");
+const canvas    = document.querySelector("#unity-canvas");
+
+function onResize() {
+    let w, h;
+    const r = 1080 / 1920;
+    w = window.innerWidth;
+    h = window.innerHeight;
+    if (w * r > window.innerHeight) {
+        w = Math.min(w, Math.ceil(h / r));
+    }
+    h = Math.floor(w * r);
+    container.style.width  = canvas.style.width  = w + "px";
+    container.style.height = canvas.style.height = h + "px";
+    container.style.top    = Math.floor((window.innerHeight - h) / 2) + "px";
+    container.style.left   = Math.floor((window.innerWidth  - w) / 2) + "px";
+}
+window.addEventListener('resize', onResize);
+onResize();
+
+const loadingCover     = document.querySelector("#loading-cover");
+const progressBarEmpty = document.querySelector("#unity-progress-bar-empty");
+const progressBarFull  = document.querySelector("#unity-progress-bar-full");
+const spinner          = document.querySelector('.spinner');
+
+loadingCover.style.display = "";
+
+if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+    container.className = "unity-mobile";
+}
+
+(function preventPageScroll() {
+    document.body.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+    if (/iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+        document.documentElement.style.cssText = 'position:fixed;overflow:hidden;height:100%';
+    }
+})();
+
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('visibilitychange', () => SetVisibility(!document.hidden));
+window.addEventListener('blur',        () => SetVisibility(false));
+window.addEventListener('focus',       () => SetVisibility(true));
+window.addEventListener('pointerdown', () => { FocusGame(); SetVisibility(true); });
+
+function InstallBlurFocusBlocker() {
+    if (!('onblur' in document) || window.blurFocusHandlersInstalled) return;
+    window.addEventListener('blur', function() {
+        const btn = document.createElement('button');
+        btn.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:9999;background:rgba(0,0,0,0);border:none;cursor:default;';
+        document.body.appendChild(btn);
+        function remove() { btn.parentNode && btn.parentNode.removeChild(btn); window.removeEventListener('focus', remove); }
+        window.addEventListener('focus', remove);
+    });
+    window.blurFocusHandlersInstalled = true;
+}
+
+function setProgress(pct) {
+    spinner.style.display          = "none";
+    progressBarEmpty.style.display = "";
+    progressBarFull.style.width    = Math.min(pct, 100) + "%";
+}
+
+async function fetchParts(urls, startPct, endPct, patch) {
+    const step   = (endPct - startPct) / urls.length;
+    const chunks = [];
+    for (let i = 0; i < urls.length; i++) {
+        const resp = await fetch(urls[i]);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} - ${urls[i]}`);
+        chunks.push(new Uint8Array(await resp.arrayBuffer()));
+        setProgress(Math.round(startPct + step * (i + 1)));
+    }
+    const total  = chunks.reduce((s, c) => s + c.length, 0);
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) { merged.set(c, offset); offset += c.length; }
+    if (patch) patch(merged);
+    return URL.createObjectURL(new Blob([merged]));
+}
+
+(async () => {
+    try {
+        setProgress(2);
+
+        const [dataUrl, wasmUrl] = await Promise.all([
+            fetchParts(DATA_URLS, 2,  50),
+            fetchParts(WASM_URLS, 50, 88, window.__patchGameWasm),
+        ]);
+
+        setProgress(92);
+
+        const config = {
+            dataUrl:            dataUrl,
+            frameworkUrl:       FRAMEWORK_URL,
+            codeUrl:            wasmUrl,
+            streamingAssetsUrl: CDN3 + "StreamingAssets",
+            companyName:        "DefaultCompany",
+            productName:        "gpt2d",
+            productVersion:     "1.0",
+        };
+
+        const _origFetch = window.fetch;
+        window.fetch = function(url, opts) {
+            if (typeof url === 'string' && url.includes('yandexcloud.net')) {
+                console.warn('[BLOCKED] yandexcloud fetch:', url);
+                return Promise.reject(new Error('blocked'));
+            }
+            return _origFetch.apply(this, arguments);
+        };
+
+        const loaderScript  = document.createElement("script");
+        loaderScript.crossOrigin = "anonymous";
+        loaderScript.src    = LOADER_URL;
+        loaderScript.onload = () => {
+            InstallBlurFocusBlocker();
+            createUnityInstance(canvas, config, (p) => {
+                setProgress(Math.round(88 + p * 10));
+            }).then((inst) => {
+                ygGameInstance = inst;
+                loadingCover.style.background = "";
+                loadingCover.style.display    = "none";
+
+                YG2Instance('SetEnvirData', environmentData);
+                setTimeout(() => YG2Instance('InitSDKComplete'), 300);
+                [900, 2500, 6000].forEach(t => setTimeout(() => {
+                    try { inst.SendMessage('YandexGame', '_SwitchLanguage', 'en'); } catch (e) {}
+                }, t));
+                setTimeout(() => {
+                    YG2Instance('SetEnvirData',    JSON.stringify({ language:'en', domain:'com', deviceType:'desktop', isMobile:false, isDesktop:true, isTablet:false, isTV:false, appID:'0', browserLang:'en', payload:'', platform:'', browser:'Other' }));
+                    YG2Instance('SetAuth',         NotAuthorized());
+                    YG2Instance('SetLoadSaves',    DEFAULT_SAVE);
+                    YG2Instance('ReceiveStats',    NO_DATA);
+                    YG2Instance('PaymentsEntries', NO_DATA);
+                }, 600);
+
+                canvas.focus();
+            }).catch(e => {
+                console.error(e);
+                progressBarFull.textContent = "Hata: " + e;
+            });
+        };
+        document.body.appendChild(loaderScript);
+
+    } catch (err) {
+        console.error("Yukleme hatasi:", err);
+        progressBarFull.style.width = "100%";
+        progressBarFull.textContent = "Yukleme hatasi: " + err.message;
+    }
+})();
+</script>
+
+<style>
+#spd, #spd-toast {
+    --bg: rgba(16,16,18,.86); --line: rgba(255,255,255,.09); --text: #e9e9ec; --dim: #8a8a92;
+    font: 12px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--text); user-select: none; -webkit-user-select: none;
+}
+#spd {
+    position: fixed; top: 12px; left: 50%; z-index: 100000; box-sizing: border-box;
+    width: max-content; max-width: calc(100vw - 24px);
+    display: grid; grid-template-columns: 210px 1px 210px 1px 190px 1px 190px; column-gap: 16px; align-items: start;
+    padding: 12px 14px 10px; transform: translateX(-50%); background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 8px 24px rgba(0,0,0,.45);
+    transition: opacity .16s ease, transform .16s ease;
+}
+#spd.off:not(.paused) { opacity: 0; transform: translate(-50%, -6px) scale(.98); pointer-events: none; }
+#spd .vsep { align-self: stretch; background: var(--line); }
+#spd .col > .label { display: block; margin-bottom: 10px; }
+#spd .col .row:first-child .label { margin: 0; }
+@media (max-width: 980px) {
+    #spd { grid-template-columns: 1fr; row-gap: 12px; width: calc(100vw - 24px); }
+    #spd .vsep { height: 1px; }
+}
+#spd .row { display: flex; align-items: center; justify-content: space-between; }
+#spd .label { color: var(--dim); letter-spacing: .08em; text-transform: uppercase; font-size: 10px; font-weight: 600; }
+#spd .val { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; cursor: pointer; }
+#spd .val:hover { color: #fff; }
+#spd input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 4px; margin: 12px 0 10px;
+    border-radius: 4px; outline: none; cursor: pointer;
+    background: linear-gradient(to right, #e9e9ec var(--fill, 50%), #2c2c31 var(--fill, 50%));
+}
+#spd input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: #fff; border: 0; box-shadow: 0 0 0 4px rgba(255,255,255,.08);
+}
+#spd input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 0; }
+#spd .presets { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
+#spd .presets button {
+    font: inherit; font-size: 11px; font-variant-numeric: tabular-nums; padding: 5px 0; cursor: pointer;
+    color: var(--dim); background: transparent; border: 1px solid var(--line); border-radius: 6px;
+    transition: background .12s, color .12s;
+}
+#spd .presets button:hover { color: var(--text); background: rgba(255,255,255,.05); }
+#spd .presets button.on { color: #111; background: #e9e9ec; border-color: #e9e9ec; }
+#spd .hint { grid-column: 1 / -1; margin-top: 10px; color: var(--dim); font-size: 11px; text-align: center; }
+kbd {
+    display: inline-block; min-width: 16px; padding: 1px 5px; margin: 0 2px; border-radius: 4px;
+    border: 1px solid var(--line); border-bottom-width: 2px; background: rgba(255,255,255,.04);
+    color: var(--text); font: 600 10px/1.4 ui-monospace, Consolas, monospace; text-align: center;
+}
+.ar .row { display: flex; align-items: center; justify-content: space-between; }
+.ar .row + .row { margin-top: 10px; }
+.ar .lbl { font-size: 12px; color: var(--text); }
+.ar .sub { font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.ar .wait input[type=range] { margin: 8px 0 0; }
+.ar.off .wait { opacity: .35; pointer-events: none; }
+.sw {
+    position: relative; width: 30px; height: 17px; border-radius: 17px; cursor: pointer;
+    background: #2c2c31; border: 1px solid var(--line); transition: background .15s;
+}
+.sw::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%;
+    background: #8a8a92; transition: transform .15s, background .15s;
+}
+.sw.on { background: #e9e9ec; }
+.sw.on::after { transform: translateX(13px); background: #111; }
+
+#frame-hold { position: fixed; display: none; z-index: 50; pointer-events: none; }
+#stats {
+    position: fixed; top: 10px; left: 10px; z-index: 99999; pointer-events: none;
+    padding: 7px 10px; border-radius: 8px; background: rgba(0,0,0,.32);
+    font: 600 11px/1.5 ui-monospace, Consolas, "SF Mono", monospace; color: rgba(255,255,255,.88);
+    text-shadow: 0 1px 2px rgba(0,0,0,.6); white-space: pre; font-variant-numeric: tabular-nums;
+    transition: opacity .15s;
+}
+#stats.off { opacity: 0; }
+#death-marks { position: fixed; z-index: 60; pointer-events: none; display: none; }
+.ar .sub.clear { cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.ar .sub.clear:hover { color: var(--text); }
+#stats .k { color: rgba(255,255,255,.5); }
+#stats .nc { color: #ffb3b3; }
+
+#spd-toast {
+    position: fixed; top: 12px; left: 50%; z-index: 100000; padding: 7px 10px;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    opacity: 0; transform: translate(-50%, -6px); pointer-events: none; transition: opacity .18s, transform .18s;
+}
+#spd-toast.show { opacity: 1; transform: translate(-50%, 0); }
+</style>
+
+<div id="spd">
+    <div class="col">
+        <div class="row"><span class="label">Game speed</span><span class="val" id="spd-val" title="Click to reset">1.00×</span></div>
+        <input id="spd-range" type="range" min="-3.32" max="3" step="0.01" value="0">
+        <div class="presets" id="spd-presets">
+            <button data-s="0.25">.25×</button><button data-s="0.5">.5×</button><button data-s="1">1×</button><button data-s="2">2×</button><button data-s="4">4×</button>
+        </div>
+    </div>
+    <div class="vsep"></div>
+    <div class="col">
+        <span class="label">Practice</span>
+        <div class="ar" data-ar></div>
+        <div class="ar" style="margin-top:10px">
+            <div class="row"><span class="lbl">Noclip</span><span class="sw" id="noclip-sw" role="switch" tabindex="0"></span></div>
+            <div class="row"><span class="lbl">Click between frames</span><span class="sw" id="cbf-sw" role="switch" tabindex="0"></span></div>
+        </div>
+    </div>
+    <div class="vsep"></div>
+    <div class="col">
+        <span class="label">Extras</span>
+        <div class="ar">
+            <div class="row"><span class="lbl">Music matches speed</span><span class="sw" id="music-sw" role="switch" tabindex="0"></span></div>
+            <div class="row"><span class="sub">Pitch shifts with speed</span></div>
+            <div class="row"><span class="lbl">Stats overlay <kbd>H</kbd></span><span class="sw" id="stats-sw" role="switch" tabindex="0"></span></div>
+            <div class="row"><span class="lbl">Death markers <kbd>M</kbd></span><span class="sw" id="marks-sw" role="switch" tabindex="0"></span></div>
+            <div class="row"><span class="sub" id="marks-stat">—</span><span class="sub clear" id="marks-clear">clear</span></div>
+            <div class="row"><span class="lbl">Attempt playback <kbd>T</kbd></span><span class="sw" id="paths-sw" role="switch" tabindex="0"></span></div>
+            <div class="row"><span class="lbl">Highlight my wave</span><span class="sw" id="hl-sw" role="switch" tabindex="0"></span></div>
+        </div>
+    </div>
+    <div class="vsep"></div>
+    <div class="col">
+        <span class="label">Performance</span>
+        <div class="ar">
+            <div class="row"><span class="lbl">Only load what's near</span><span class="sw" id="perf-sw" role="switch" tabindex="0"></span></div>
+            <div class="row"><span class="sub" id="perf-stat">Off</span></div>
+            <div class="row"><span class="lbl">Glow &amp; effects</span><span class="sw" id="glow-sw" role="switch" tabindex="0"></span></div>
+            <div class="row"><span class="sub" id="glow-stat">Off = faster on weak graphics</span></div>
+        </div>
+    </div>
+    <div class="hint">Press <kbd>F</kbd> to show / hide · always opens while paused</div>
+</div>
+<canvas id="frame-hold"></canvas>
+<canvas id="death-marks"></canvas>
+<div id="stats" class="off"></div>
+<div id="spd-toast">Panel hidden · press <kbd>F</kbd> to show</div>
+
+<script>
+(function () {
+    var panel = document.getElementById('spd'), range = document.getElementById('spd-range'),
+        val = document.getElementById('spd-val'), toast = document.getElementById('spd-toast'),
+        btns = document.querySelectorAll('#spd-presets button'), toastTimer;
+    var MIN = parseFloat(range.min), MAX = parseFloat(range.max);
+
+    function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+    function load(k)     { try { return localStorage.getItem(k); } catch (e) { return null; } }
+
+    function setSpeed(s, save) {
+        s = Math.min(8, Math.max(0.1, s));
+        window.__setGameSpeed(s);
+        var lg = Math.log2(s);
+        range.value = lg;
+        range.style.setProperty('--fill', ((lg - MIN) / (MAX - MIN) * 100) + '%');
+        val.textContent = s.toFixed(2) + '×';
+        btns.forEach(function (b) { b.classList.toggle('on', Math.abs(parseFloat(b.dataset.s) - s) < 0.005); });
+        if (save !== false) store('l67-speed', s);
+    }
+
+    range.addEventListener('input', function () {
+        var s = Math.pow(2, parseFloat(range.value));
+        if (Math.abs(s - 1) < 0.04) s = 1;            // gentle snap to normal speed
+        setSpeed(s);
+    });
+    range.addEventListener('change', function () { range.blur(); var c = document.getElementById('unity-canvas'); if (c) c.focus(); });
+    btns.forEach(function (b) { b.addEventListener('click', function () { setSpeed(parseFloat(b.dataset.s)); b.blur(); }); });
+    val.addEventListener('click', function () { setSpeed(1); });
+
+    // keep clicks on the panel from being grabbed by the game's focus handler
+    panel.addEventListener('pointerdown', function (e) { e.stopPropagation(); });
+
+    function setVisible(on) {
+        panel.classList.toggle('off', !on);
+        store('l67-panel', on ? '1' : '0');
+        clearTimeout(toastTimer);
+        toast.classList.toggle('show', !on);
+        if (!on) toastTimer = setTimeout(function () { toast.classList.remove('show'); }, 1800);
+    }
+
+    window.addEventListener('keydown', function (e) {
+        if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.key === 'f' || e.key === 'F') setVisible(panel.classList.contains('off'));
+    }, true);
+
+    var musicSw = document.getElementById('music-sw');
+    function setMusicFollow(on) {
+        window.__l67MusicFollow = on;
+        musicSw.classList.toggle('on', on);
+        musicSw.setAttribute('aria-checked', on);
+        store('l67-musicspeed', on ? '1' : '0');
+        if (window.__l67SyncMusic) window.__l67SyncMusic();
+    }
+    musicSw.addEventListener('click', function () { setMusicFollow(!window.__l67MusicFollow); });
+    setMusicFollow(load('l67-musicspeed') === '1');
+
+    setSpeed(parseFloat(load('l67-speed')) || 1, false);
+    if (load('l67-panel') === '0') { panel.classList.add('off'); }
+})();
+</script>
+
+<script>
+(function () {
+    // ---- settings (shared by the F panel and the pause card) ----
+    function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+    function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+    var state = {
+        on:   load('l67-autoretry') === '1',
+        wait: parseFloat(load('l67-retrywait'))
+    };
+    if (!(state.wait >= 0)) state.wait = 0.25;
+    var WAIT_MAX = 3;
+
+    var blocks = Array.prototype.map.call(document.querySelectorAll('[data-ar]'), function (el) {
+        el.innerHTML =
+            '<div class="row"><span class="lbl">Auto-retry on death</span><span class="sw" role="switch" tabindex="0"></span></div>' +
+            '<div class="wait"><div class="row"><span class="lbl">Delay after death</span><span class="sub"></span></div>' +
+            '<input type="range" min="0" max="' + WAIT_MAX + '" step="0.05"></div>';
+        var sw = el.querySelector('.sw'), range = el.querySelector('input'), out = el.querySelector('.sub');
+        sw.addEventListener('click', function () { state.on = !state.on; save(); render(); });
+        range.addEventListener('input', function () { state.wait = parseFloat(range.value); save(); render(); });
+        range.addEventListener('change', function () { range.blur(); });
+        el.addEventListener('pointerdown', function (e) { e.stopPropagation(); });
+        return { el: el, sw: sw, range: range, out: out };
+    });
+    function save() {
+        store('l67-autoretry', state.on ? '1' : '0'); store('l67-retrywait', state.wait);
+        if (window.__l67ApplyDelay) window.__l67ApplyDelay();
+    }
+    function render() {
+        blocks.forEach(function (b) {
+            b.el.classList.toggle('off', !state.on);
+            b.sw.classList.toggle('on', state.on);
+            b.sw.setAttribute('aria-checked', state.on);
+            b.range.value = state.wait;
+            b.range.style.setProperty('--fill', (state.wait / WAIT_MAX * 100) + '%');
+            b.out.textContent = state.wait === 0 ? 'instant' : state.wait.toFixed(2) + 's';
+        });
+    }
+    render();
+
+    // ---- talking to the patched game ----
+    var IS_INPUT_PRESSED = 0x3C4F;               // WaveController.IsWaveInputPressed (function table index)
+    var OFF_ATTEMPTS     = 0xC8;                 // WaveController.currentAttempts
+    var PAUSE_CLASS      = 7030980;              // PauseManager class pointer (static isPaused at +4)
+    var DEATH            = 1.846;                // Explode_11 death sound length, used as a backup signal
+
+    var OFF_RESPAWN      = 0x38;                 // WaveController.respawnDelay (game default 0.7s)
+    var WAVE_CLASS       = 7034460;              // WaveController class pointer
+
+    var startAttempts = null, deathSinceStart = false, realPressed = null;
+    var lastWave = 0, origDelay = null;
+
+    // The death -> respawn pause comes from the game's own respawnDelay (0.7s), not from us.
+    // With auto-retry on, we set respawnDelay to your chosen wait so the whole gap is exactly that.
+    function applyDelay() {
+        var ex = window.__l67.exports;
+        if (!ex || !lastWave) return;
+        var buf = ex.memory.buffer, u32 = new Uint32Array(buf);
+        if (u32[lastWave >> 2] !== u32[WAVE_CLASS >> 2]) return;   // object no longer a WaveController
+        var f32 = new Float32Array(buf), i = (lastWave + OFF_RESPAWN) >> 2;
+        if (origDelay === null) {
+            if (!(f32[i] >= 0 && f32[i] < 10)) return;            // sanity check before ever writing
+            origDelay = f32[i];
+        }
+        f32[i] = state.on ? state.wait : origDelay;
+    }
+    window.__l67ApplyDelay = applyDelay;
+
+    function mem() { var e = window.__l67.exports; return e && e.memory && e.memory.buffer; }
+
+    window.__l67StartCheck = function (wave) {
+        var ex = window.__l67.exports;
+        if (!ex) return false;
+        if (!realPressed) realPressed = ex.__indirect_function_table.get(IS_INPUT_PRESSED);
+        var buf = ex.memory.buffer;
+        var attempts = new Int32Array(buf)[(wave + OFF_ATTEMPTS) >> 2];
+
+        if (wave !== lastWave) { lastWave = wave; window.__l67Wave = wave; }
+        applyDelay();
+
+        if (realPressed(wave, 0)) { startAttempts = attempts; deathSinceStart = false; return true; }
+
+        // the wait already happened inside the game's respawn, so go on the very first frame
+        var retry = deathSinceStart || (startAttempts !== null && attempts > startAttempts);
+        if (state.on && retry) {
+            startAttempts = attempts; deathSinceStart = false; return true;
+        }
+        return false;
+    };
+
+    window.addEventListener('l67-sound', function (e) {
+        if (Math.abs(e.detail - DEATH) < 0.03 && startAttempts !== null) deathSinceStart = true;
+    });
+
+    // all deaths come through here (see the Die patch in <head>)
+    var DIE_FN = 0x3C47;                      // WaveController.Die(bool)
+    window.__l67Die = function (wave, playParticles) {
+        var skip = !!window.__l67Noclip;
+        if (window.__l67OnDie) { try { window.__l67OnDie(skip); } catch (e) {} }
+        if (skip) return;                     // noclip: the hit is counted, the death never happens
+        deathSinceStart = true;               // works in normal and practice mode alike
+        window.__l67.exports.__indirect_function_table.get(DIE_FN)(wave, playParticles, 0);
+    };
+    window.__l67CloneDie = function (clone, playParticles) {
+        if (window.__l67Noclip) { if (window.__l67OnDie) { try { window.__l67OnDie(true); } catch (e) {} } return; }
+        window.__l67.exports.__indirect_function_table.get(0x3C00)(clone, playParticles, 0);   // WaveCloneController.Die
+    };
+
+    // open the panel whenever the game's own pause menu is open
+    var card = document.getElementById('spd');
+    setInterval(function () {
+        var buf = mem(), paused = false;
+        if (buf) {
+            var u32 = new Uint32Array(buf), cls = u32[PAUSE_CLASS >> 2];
+            var statics = cls ? u32[(cls + 92) >> 2] : 0;
+            paused = statics ? new Uint8Array(buf)[statics + 4] === 1 : false;
+            // out of a level: forget pending retries so the next level waits for you
+            if (window.__l67InLevel && window.__l67InLevel(buf) === false) { deathSinceStart = false; startAttempts = null; }
+        }
+        card.classList.toggle('paused', paused);
+    }, 150);
+
+    // ---- hide the dark respawn frame ----
+    // On respawn the game resets the level to its dark starting colors for a frame before the run's color
+    // trigger brightens it again. We keep a copy of the last normal frame and show it over the canvas for
+    // exactly those frames, so you never see the dark one.
+    var glCanvas = document.getElementById('unity-canvas');
+    var hold = document.getElementById('frame-hold'), hctx = hold.getContext('2d');
+    var phase = 'idle', frames = 0, moving = 0, haveShot = false;
+
+    function waitingForInput(buf) {
+        var u32 = new Uint32Array(buf), cls = u32[WAVE_CLASS >> 2];
+        var st = cls ? u32[(cls + 92) >> 2] : 0;
+        return st ? new Uint8Array(buf)[st + 4] === 1 : false;
+    }
+    function waveIsDead(buf) {
+        if (!lastWave) return false;
+        var u32 = new Uint32Array(buf);
+        if (u32[lastWave >> 2] !== u32[WAVE_CLASS >> 2]) return false;
+        return new Uint8Array(buf)[lastWave + 0x1C] === 1;
+    }
+    function snapshot() {
+        if (hold.width !== glCanvas.width || hold.height !== glCanvas.height) {
+            hold.width = glCanvas.width; hold.height = glCanvas.height;
+        }
+        hctx.drawImage(glCanvas, 0, 0);
+        haveShot = true;
+    }
+    function showHold() {
+        var r = glCanvas.getBoundingClientRect();
+        hold.style.left = r.left + 'px'; hold.style.top = r.top + 'px';
+        hold.style.width = r.width + 'px'; hold.style.height = r.height + 'px';
+        hold.style.display = 'block';
+    }
+    function hideHold() { hold.style.display = 'none'; phase = 'idle'; haveShot = false; }
+
+    window.__l67AfterFrame = function () {
+        var ex = window.__l67.exports;
+        if (!ex || !state.on) { if (phase !== 'idle') hideHold(); return; }
+        var buf = ex.memory.buffer;
+        var waiting = waitingForInput(buf);
+
+        if (phase === 'idle') {
+            if (waveIsDead(buf)) { phase = 'dead'; frames = 0; }
+            else return;
+        }
+        frames++;
+        if (phase === 'dead') {
+            if (!waiting) { snapshot(); if (frames > 600) hideHold(); return; }
+            if (haveShot) { showHold(); phase = 'hold'; frames = 0; } else hideHold();
+            return;
+        }
+        if (phase === 'hold') {
+            // keep covering until the run is moving and its colors have kicked in (a few frames)
+            if (waiting) { moving = 0; if (frames > 90) hideHold(); return; }
+            if (++moving >= 4) hideHold();
+        }
+    };
+
+    setTimeout(function () {
+        if (!window.__l67Patched) console.warn('[auto-retry] not active: the game code patch was not applied');
+    }, 15000);
+})();
+</script>
+<script>
+// ---- Performance: only keep level objects near the screen active ----
+// Every placed level object normally stays alive the whole level (rendering checks, physics, scripts).
+// With this on, plain static objects (blocks, spikes, saws, decoration) that are far from the camera are
+// switched off with the game's own GameObject.SetActive, and switched back on well before they scroll
+// into view (1.5 screens ahead), so nothing ever pops in. Anything that can move, be triggered, or is
+// looked up by the game (triggers, portals, coins, keys, checkpoints, grouped objects) is never touched.
+(function () {
+    var PLAIN = new Set(["Ball001_0", "Block (0", "Block (10)", "Block (11)", "Block (12)", "Block (13)", "Block (14)", "Block (15)", "Block (2)", "Block (3)", "Block (4)", "Block (5)", "Block (6)", "Block (7)", "Block (8)", "Block (9)", "Block1", "Block1 (2z)", "Block1 (2z) (1)", "Block1 (2z) (10)", "Block1 (2z) (11)", "Block1 (2z) (13)", "Block1 (2z) (13)(Clone) (181)", "Block1 (2z) (14)", "Block1 (2z) (2)", "Block1 (2z) (3)", "Block1 (2z) (4)", "Block1 (2z) (5)", "Block1 (2z) (6)", "Block1 (2z) (7)", "Block1 (2z) (8)", "Block1 (2z) (9)", "Block1 (4z)", "Block1 (4z) (1)", "Block1 (7z)", "Block1 (9z)", "Block1 (9z) (1)", "Block1 (9z) (11)", "Block1 (9z)(Clone) (180)", "Block1 (9z)(Clone) (196)", "Block1 (9z)(Clone) (199)", "Block1 (9z)(Clone) (24)", "Block1 (9z)(Clone) (253)", "Block1 (9z)(Clone) (279)", "Block1 (9z)(Clone) (351)", "Block1 (9z)(Clone) (375)", "Block1(newInvis) (2)", "Block21", "Block22", "Block23", "Block24", "Block26", "Block28", "CubeSpikeFloor", "Decor1", "Decor1 (1)", "Decor1 (10)", "Decor1 (11)", "Decor1 (12)", "Decor1 (13)", "Decor1 (14)", "Decor1 (15)", "Decor1 (16)", "Decor1 (17)", "Decor1 (18)", "Decor1 (19)", "Decor1 (2)", "Decor1 (3)", "Decor1 (4)", "Decor1 (5)", "Decor1 (6)", "Decor1 (7)", "Decor1 (8)", "Decor1 (9)", "Decorn", "Decorn10", "Decorn11", "Decorn12", "Decorn13", "Decorn14", "Decorn15", "Decorn16", "Decorn17", "Decorn18", "Decorn19", "Decorn2", "Decorn20", "Decorn3", "Decorn4", "Decorn5", "Decorn6", "Decorn7", "Decorn8", "Decorn9", "Dual", "GameObject", "GameObject25", "GameObject27", "GameObject29", "GameObject31", "GameObject32", "GameObject33", "GameObject34", "GameObject35", "GameObject36", "GameObject37", "GameObject38", "GameObject39", "GameObject40", "GameObject53", "GameObject54", "GameObject55", "GameObject56", "GameObject57", "GameObject58", "GameObject59", "GameObject60", "GameObject61", "GameObject61 (1)", "GameObject62", "GameObject62 (1)", "GameObject63", "GameObject63 (1)", "GameObject64", "GameObject64 (1)", "GameObject65", "GameObject66", "GameObject67", "GameObject68", "GameObject69", "GameObject70", "GameObject71", "GameObject72", "GameObject73", "GameObject74", "GameObject75", "GameObject76", "GameObject77", "GameObject78", "GameObject79", "GameObject80", "GameObjectSpikedfloor1", "GameObjectSpikedfloor1 (1)", "GameObjectSpikedfloor1 (2)", "GameObjectSpikedfloor1 (3)", "GameObjectSpikedfloor2", "GameObjectSpikedfloor2 (1)", "GameObjectSpikedfloor2 (2)", "GameObjectSpikedfloor2 (3)", "GameObjectstar", "InvisSaw1", "InvisSaw2", "InvisSaw3", "NewBlock (1)", "NewBlock2", "NewBlock2 (1)", "NewBlock2 (10)", "NewBlock2 (11)", "NewBlock2 (11)(Clone) (10)", "NewBlock2 (12)", "NewBlock2 (2)", "NewBlock2 (3)", "NewBlock2 (4)", "NewBlock2 (5)", "NewBlock2 (6)", "NewBlock2 (7)", "NewBlock2 (8)", "NewBlock2 (9)", "Outline (1)", "Outline (10)", "Outline (11)", "Outline (12)", "Outline (13)", "Outline (14)", "Outline (14)(Clone) (18)", "Outline (15)", "Outline (16)", "Outline (17)", "Outline (18)", "Outline (4)", "Outline (5)", "Outline (6)", "Outline (7)", "Outline (8)", "Outline (9)", "OutlineBlock", "OutlineBlock (1)", "OutlineBlock (2)", "OutlineBlock (4)", "OutlineBlock (5)", "OutlineBlock (5)(Clone) (10)", "OutlineBlock (6)", "OutlineBlock (7)", "OutlineSlope", "OutlineSlope(1)", "OutlineSlope(2)", "OutlineSlope(3)", "OutlineSlope(Clone) (4)", "Page2StairsDecor1", "Page2StairsDecor1 (1)", "Page2StairsDecor1 (2)", "Page2StairsDecor1 (3)", "Page2StairsDecor1 (4)", "Page2StairsDecor2", "Page2StairsDecor2 (1)", "Page2StairsDecor2 (2)", "Page2StairsDecor2 (3)", "Page2StairsDecor2 (4)", "Page2StairsDecor2(Clone) (82)", "Page2StairsDecor3", "Page2StairsDecor3 (1)", "Page2StairsDecor3 (2)", "Page2StairsDecor3 (3)", "Page2StairsDecor3 (4)", "Page2StairsDecor4", "Page2StairsDecor4 (1)", "Page2StairsDecor4 (2)", "Page2StairsDecor4 (3)", "Page2StairsDecor4 (4)", "Player (1)", "SmallSlopeDecor1", "SmallSlopeDecor1 (1)", "SmallSlopeDecor1 (2)", "SmallSlopeDecor10", "SmallSlopeDecor11", "SmallSlopeDecor12", "SmallSlopeDecor13", "SmallSlopeDecor14", "SmallSlopeDecor15", "SmallSlopeDecor16", "SmallSlopeDecor17", "SmallSlopeDecor18", "SmallSlopeDecor19", "SmallSlopeDecor2", "SmallSlopeDecor2 (1)", "SmallSlopeDecor2 (2)", "SmallSlopeDecor20", "SmallSlopeDecor21", "SmallSlopeDecor22", "SmallSlopeDecor23", "SmallSlopeDecor24", "SmallSlopeDecor25", "SmallSlopeDecor26", "SmallSlopeDecor27", "SmallSlopeDecor28", "SmallSlopeDecor29", "SmallSlopeDecor3", "SmallSlopeDecor3 (1)", "SmallSlopeDecor3 (2)", "SmallSlopeDecor30", "SmallSlopeDecor31", "SmallSlopeDecor32", "SmallSlopeDecor33", "SmallSlopeDecor34", "SmallSlopeDecor35", "SmallSlopeDecor36", "SmallSlopeDecor37", "SmallSlopeDecor38", "SmallSlopeDecor39", "SmallSlopeDecor4", "SmallSlopeDecor4 (1)", "SmallSlopeDecor4 (2)", "SmallSlopeDecor40", "SmallSlopeDecor41", "SmallSlopeDecor41(Clone) (70)", "SmallSlopeDecor42", "SmallSlopeDecor43", "SmallSlopeDecor44", "SmallSlopeDecor45", "SmallSlopeDecor46", "SmallSlopeDecor47", "SmallSlopeDecor48", "SmallSlopeDecor49", "SmallSlopeDecor5", "SmallSlopeDecor5 (1)", "SmallSlopeDecor50", "SmallSlopeDecor51", "SmallSlopeDecor52", "SmallSlopeDecor53", "SmallSlopeDecor54", "SmallSlopeDecor55", "SmallSlopeDecor56", "SmallSlopeDecor57", "SmallSlopeDecor58", "SmallSlopeDecor59", "SmallSlopeDecor6", "SmallSlopeDecor6 (1)", "SmallSlopeDecor60", "SmallSlopeDecor61", "SmallSlopeDecor62", "SmallSlopeDecor63", "SmallSlopeDecor64", "SmallSlopeDecor65", "SmallSlopeDecor66", "SmallSlopeDecor67", "SmallSlopeDecor68", "SmallSlopeDecor7", "SmallSlopeDecor7 (1)", "SmallSlopeDecor8", "SmallSlopeDecor8 (1)", "SmallSlopeDecor9", "Solo", "Square", "Stairs1 (12)", "Stairs1 (13)", "Stairs1 (4)", "Stairs1 (5)", "Stairs1 (6)", "Stairs1 (7)", "StairsDecor1", "StairsDecor1 (1)", "StairsDecor1 (2)", "StairsDecor1 (3)", "StairsDecor1(Clone) (49)", "StairsDecor1(Clone) (548)", "StairsDecor2", "StairsDecor2 (1)", "StairsDecor2 (2)", "StairsDecor2 (3)", "StairsDecor3", "StairsDecor3 (1)", "StairsDecor3 (2)", "StairsDecor3 (3)", "StairsDecor4", "StairsDecor4 (1)", "StairsDecor4 (2)", "StairsDecor4 (3)", "StairsDecor4(Clone) (31)", "Symbol", "Symbol (1)", "Symbol (2)", "Symbol (3)", "Symbol (4)", "Symbol (5)", "Symbol (6)", "Symbol (7)", "W (0)", "W (0)0", "W (0)11", "W (0)12", "W (0)13", "W (0)15", "W (0)16", "W (0)2", "W (0)21", "W (0)22", "W (0)23", "W (0)3", "W (0)5", "W (0)6", "W (0)67", "W (0)9", "W (014", "W (04", "W (044", "W (08", "bn1", "bn10", "bn11", "bn12", "bn13", "bn14", "bn15", "bn15(Clone) (7)", "bn16", "bn17", "bn18", "bn19", "bn2", "bn21", "bn22", "bn23", "bn24", "bn25", "bn26", "bn27", "bn28", "bn29", "bn29(Clone) (33)", "bn3", "bn30", "bn30(Clone) (160)", "bn31", "bn32", "bn33", "bn34", "bn35", "bn36", "bn37", "bn38", "bn39", "bn4", "bn40", "bn5", "bn6", "bn7", "bn8", "bn8(Clone) (588)", "bn9", "newFakeSmallSpioke", "newFakeSmallSpioke (1)", "newFakeSmallSpioke (2)", "newFakeSpioke", "newFakeSpioke (1)", "newFakeSpioke (2)", "newInvisivleSpioke", "newInvisivleSpioke (1)", "newInvisivleSpioke (2)", "newInvisivleSpioke (2)(Clone) (188)", "newInvisivleSpioke (3)", "newInvisivleSpiokew", "newSlopeDead", "newSlopeDead2", "newSlopeDead3", "newSlopeDead4", "newSlopeNew", "newSlopeNew31", "pixil-frame-0 (59)_0", "pixil-frame-0 (71)_0", "pixil-frame-0 (77)_0", "pixil-frame-0 (81)", "pixil-frame-0 (82)", "pixil-frame-0 (84)_0", "pixil-frame-0 (85)_0", "rgbUnTouchable", "rgbUnTouchable10", "rgbUnTouchable11", "rgbUnTouchable12", "rgbUnTouchable13", "rgbUnTouchable14", "rgbUnTouchable15", "rgbUnTouchable16", "rgbUnTouchable17", "rgbUnTouchable18", "rgbUnTouchable19", "rgbUnTouchable2", "rgbUnTouchable20", "rgbUnTouchable3", "rgbUnTouchable4", "rgbUnTouchable5", "rgbUnTouchable6", "rgbUnTouchable7", "rgbUnTouchable8", "rgbUnTouchable9", "saw1", "saw1 (1)", "saw1 (10)", "saw1 (11)", "saw1 (12)", "saw1 (13)", "saw1 (14)", "saw1 (18)", "saw1 (19)", "saw1 (2)", "saw1 (2)(Clone) (34)", "saw1 (3)", "saw1 (4)", "saw1 (4)(Clone) (37)", "saw1 (5)", "saw1 (5)(Clone) (3)", "saw1 (6)", "saw1 (7)", "saw1 (8)", "saw1 (9)", "saw1(Clone) (7)", "shipp_0", "smallSlope", "smallSlope (1)", "smallSlope (2)", "smallSlope (3)", "speed", "speed0", "speed1", "speed2", "speed3", "speed4", "speed5", "spike (16)", "spike (17)", "spike (18)", "spike (19)", "spoike1", "spoike1 (1)", "spoike1(Clone) (9)", "spoike10", "spoike11", "spoike11 (1)", "spoike11 (2)", "spoike11 (3)", "spoike12", "spoike13", "spoike14", "spoike14 (1)", "spoike2", "spoike2 (1)", "spoike20", "spoike20 (1)", "spoike3", "spoike4", "spoike5", "spoike5 (4)", "spoike6", "spoike7", "spoike8", "spoike9", "uf1_0"]);
+    var WAVE_CLASS = 7034460, GM_CLASS = 7027952;
+    var W_OBJECT_PLACER = 476, W_MAIN_CAMERA = 356, OP_PLACED = 184, OP_GROUPS = 268;
+    var F = { setActive: 0xD57, activeSelf: 0x1EA7, goTransform: 0x1E83, getPosition: 0x127D, getName: 0xCE0,
+              compTransform: 0x127A, orthoSize: 0x1601, aspect: 0x16C2, rebuildGroups: 0x1E94 };
+    var AHEAD = 1.5, BEHIND = 0.5, HYST = 0.5;   // in screen widths
+    var SWEEP_PER_FRAME = 300, OFF_PER_FRAME = 150;
+
+    var sw = document.getElementById('perf-sw'), stat = document.getElementById('perf-stat');
+    var on = false;
+    try { on = localStorage.getItem('l67-perf') === '1'; } catch (e) {}
+
+    var fns = null, vec = 0, level = null, sweep = 0, broken = false, retryAt = 0, tick = 0;
+
+    function ex() { return window.__l67 && window.__l67.exports; }
+    function bind(e) {
+        if (fns) return true;
+        var t = e.__indirect_function_table; fns = {};
+        for (var k in F) fns[k] = t.get(F[k]);
+        vec = e.malloc(16);
+        return true;
+    }
+    function views(e) { var b = e.memory.buffer; return { u8: new Uint8Array(b), i32: new Int32Array(b), u32: new Uint32Array(b), f32: new Float32Array(b) }; }
+    // (comparisons are written so a stale view after memory growth reads as "not valid")
+    function alive(m, obj) { return !!obj && m.u32[(obj + 8) >> 2] > 0; }          // UnityEngine.Object.m_CachedPtr
+    function isA(m, obj, clsAddr) { var c = m.u32[clsAddr >> 2]; return !!obj && c > 0 && m.u32[obj >> 2] === c; }
+    function staticByte(m, clsAddr, off) {
+        var cls = m.u32[clsAddr >> 2]; if (!cls) return 0;
+        var st = m.u32[(cls + 92) >> 2]; return st ? m.u8[st + off] : 0;
+    }
+    function str(m, p) {
+        if (!p) return '';
+        var n = m.i32[(p + 8) >> 2], o = (p + 12) >> 1, u16 = new Uint16Array(m.u8.buffer);
+        var s = ''; for (var i = 0; i < n && i < 200; i++) s += String.fromCharCode(u16[o + i]);
+        return s;
+    }
+    function listItems(m, list) {               // List<T> -> array of element pointers
+        if (!list) return [];
+        var items = m.u32[(list + 8) >> 2], size = m.i32[(list + 12) >> 2];
+        if (!items || size < 0 || size > m.u32[(items + 12) >> 2]) return [];
+        var out = new Array(size);
+        for (var i = 0; i < size; i++) out[i] = m.u32[(items + 16 + i * 4) >> 2];
+        return out;
+    }
+    function posX(m, go) {
+        var tr = fns.goTransform(go, 0);
+        if (!alive(m, tr)) return NaN;
+        fns.getPosition(vec, tr, 0);
+        return new Float32Array(ex().memory.buffer)[vec >> 2];
+    }
+
+    function build(e, wave) {
+        var m = views(e);
+        var op = m.u32[(wave + W_OBJECT_PLACER) >> 2];
+        if (!alive(m, op)) return null;
+        var placed = m.u32[(op + OP_PLACED) >> 2];
+
+        // objects in any group can be moved/rotated by triggers: never cull them
+        var grouped = new Set();
+        try {
+            fns.rebuildGroups(op, 0); m = views(e);
+            var dict = m.u32[(op + OP_GROUPS) >> 2];
+            if (dict) {
+                var entries = m.u32[(dict + 12) >> 2], count = m.i32[(dict + 16) >> 2];
+                if (entries && count > 0 && count <= m.u32[(entries + 12) >> 2]) {
+                    for (var i = 0; i < count; i++) {
+                        var en = entries + 16 + i * 16;
+                        if (m.i32[(en + 4) >> 2] < -1) continue;                     // free slot
+                        listItems(m, m.u32[(en + 12) >> 2]).forEach(function (g) { grouped.add(g); });
+                    }
+                }
+            }
+        } catch (err) { return null; }
+
+        var objs = [], items = listItems(m, placed);
+        for (var j = 0; j < items.length; j++) {
+            var go = items[j];
+            if (!alive(views(e), go) || grouped.has(go)) continue;
+            var name = str(views(e), fns.getName(go, 0)).replace(/(\(Clone\))+$/g, '').trim();
+            if (!PLAIN.has(name)) continue;
+            var x = posX(views(e), go);
+            if (!isFinite(x)) continue;
+            objs.push({ go: go, x: x, active: fns.activeSelf(go, 0) === 1, mine: false });
+        }
+        objs.sort(function (a, b) { return a.x - b.x; });
+        return { list: placed, size: placed ? views(e).i32[(placed + 12) >> 2] : -1, objs: objs, anchors: [], xs: objs.map(function (o) { return o.x; }) };
+    }
+
+    function lowerBound(xs, v) { var lo = 0, hi = xs.length; while (lo < hi) { var mid = (lo + hi) >> 1; if (xs[mid] < v) lo = mid + 1; else hi = mid; } return lo; }
+
+    function setActive(o, v) { fns.setActive(o.go, v ? 1 : 0, 0); o.active = v; o.mine = !v; }
+
+    function restoreAll() {
+        if (!level) return;
+        var e = ex();
+        if (e) {
+            var m = views(e);
+            level.objs.forEach(function (o) { if (o.mine && alive(m, o.go)) { try { setActive(o, true); } catch (err) {} } });
+        }
+        level = null;
+    }
+
+    function view(e, m, wave) {
+        var cam = m.u32[(wave + W_MAIN_CAMERA) >> 2];
+        if (!alive(m, cam)) return null;
+        var half = fns.orthoSize(cam, 0) * fns.aspect(cam, 0);
+        var tr = fns.compTransform(cam, 0);
+        if (!alive(views(e), tr)) return null;
+        fns.getPosition(vec, tr, 0);
+        var cx = new Float32Array(e.memory.buffer)[vec >> 2];
+        return isFinite(cx) && half > 0 ? { cx: cx, w: half * 2 } : null;
+    }
+
+    function frame() {
+        if (!on || broken) return;
+        var e = ex(), wave = window.__l67Wave;
+        if (!e || !wave) return;
+        bind(e);
+        var m = views(e);
+        var playing = window.__l67InLevel(e.memory.buffer) && isA(m, wave, WAVE_CLASS) && alive(m, wave);
+        if (!playing) { if (level) restoreAll(); stat.textContent = 'Waiting for a level'; return; }
+
+        var op = m.u32[(wave + W_OBJECT_PLACER) >> 2];
+        var placed = op ? m.u32[(op + OP_PLACED) >> 2] : 0;
+        var size = placed ? m.i32[(placed + 12) >> 2] : -1;
+        if (!level || level.list !== placed || level.size !== size) {
+            if (Date.now() < retryAt) return;
+            restoreAll();
+            level = build(e, wave);
+            if (!level) { retryAt = Date.now() + 1000; return; }
+            m = views(e);
+        }
+
+        // remember where the wave waits to start (start / checkpoints)
+        var waveX = NaN;
+        try {
+            var wt = fns.compTransform(wave, 0);
+            if (alive(views(e), wt)) { fns.getPosition(vec, wt, 0); waveX = new Float32Array(e.memory.buffer)[vec >> 2]; }
+        } catch (err) {}
+        m = views(e);
+        if (staticByte(m, WAVE_CLASS, 4) === 1 && isFinite(waveX) &&
+            !level.anchors.some(function (ax) { return Math.abs(ax - waveX) < 2; })) level.anchors.push(waveX);
+
+        var v = view(e, m, wave) || (isFinite(waveX) ? { cx: waveX, w: 40 } : null);
+        if (!v) return;
+        var aL = v.cx - v.w * (0.5 + BEHIND), aR = v.cx + v.w * (0.5 + AHEAD);       // must be active
+        var dL = aL - v.w * HYST, dR = aR + v.w * HYST;                              // may be switched off outside this
+
+        // 1) everything that should be loaded is loaded, right now (no limit)
+        var objs = level.objs, xs = level.xs;
+        function ensure(L, R) {
+            for (var i = lowerBound(xs, L); i < objs.length && objs[i].x <= R; i++) {
+                if (!objs[i].active && objs[i].mine && alive(m, objs[i].go)) setActive(objs[i], true);
+            }
+        }
+        ensure(aL, aR);
+        // places you respawn (level start, checkpoints) stay loaded, so a respawn never shows a gap
+        level.anchors.forEach(function (ax) { ensure(ax - v.w, ax + v.w * (1 + AHEAD)); });
+        // 2) a rolling sweep switches far objects off a bit at a time, and re-checks objects
+        //    the game itself may have toggled (e.g. its reset on respawn)
+        var offs = 0, n = Math.min(SWEEP_PER_FRAME, objs.length);
+        for (var k = 0; k < n; k++) {
+            sweep = (sweep + 1) % objs.length;
+            var o = objs[sweep];
+            if (!alive(m, o.go)) continue;
+            o.active = fns.activeSelf(o.go, 0) === 1;
+            var far = (o.x < dL || o.x > dR) && !level.anchors.some(function (ax) {
+                return o.x >= ax - v.w * (1 + HYST) && o.x <= ax + v.w * (1 + AHEAD + HYST);
+            });
+            if (far && o.active && offs < OFF_PER_FRAME) { setActive(o, false); offs++; }
+            else if (!far && !o.active && o.mine) setActive(o, true);
+        }
+
+        if (++tick % 15 === 0) {
+            var loaded = 0; for (var q = 0; q < objs.length; q++) if (objs[q].active) loaded++;
+            stat.textContent = objs.length ? loaded.toLocaleString() + ' / ' + objs.length.toLocaleString() + ' objects loaded'
+                                           : 'Nothing to optimize here';
+        }
+    }
+
+    // ---- Glow & effects: the game's own post-processing setting (SettingsManager) ----
+    var W_SETTINGS = 352, SM_ENABLED = 112, F_TOGGLE_VOLUME = 0x3A56;
+    var glowSw = document.getElementById('glow-sw'), glowStat = document.getElementById('glow-stat');
+    var glowWanted = null, glowShown = null, glowTick = 0;
+    try { var g = localStorage.getItem('l67-glow'); if (g !== null) glowWanted = g === '1'; } catch (e) {}
+
+    function settingsMgr(e) {
+        var wave = window.__l67Wave; if (!e || !wave) return 0;
+        var m = views(e);
+        if (!isA(m, wave, WAVE_CLASS) || !alive(m, wave)) return 0;
+        var sm = m.u32[(wave + W_SETTINGS) >> 2];
+        return alive(m, sm) ? sm : 0;
+    }
+    function showGlow(on) {
+        glowShown = on;
+        glowSw.classList.toggle('on', on); glowSw.setAttribute('aria-checked', on);
+    }
+    function glowFrame() {
+        if (glowTick++ % 10) return;
+        var e = ex(), sm = settingsMgr(e);
+        if (!sm) { if (glowWanted !== null) showGlow(glowWanted); glowStat.textContent = glowWanted === null ? 'Start a level to read this' : 'Applies when a level starts'; return; }
+        var m = views(e), cur = m.u8[sm + SM_ENABLED] === 1;
+        if (glowWanted !== null && cur !== glowWanted) {
+            e.__indirect_function_table.get(F_TOGGLE_VOLUME)(sm, 0);   // the game's own settings toggle (also saves it)
+            cur = views(e).u8[sm + SM_ENABLED] === 1;
+        }
+        glowWanted = null;
+        showGlow(cur);
+        glowStat.textContent = cur ? 'On · turn off for more FPS' : 'Off · faster on weak graphics';
+    }
+    glowSw.addEventListener('click', function () {
+        var next = !(glowWanted !== null ? glowWanted : !!glowShown);
+        glowWanted = next; showGlow(next); glowTick = 0;
+        try { localStorage.setItem('l67-glow', next ? '1' : '0'); } catch (e) {}
+    });
+    if (glowWanted !== null) showGlow(glowWanted);
+
+    var prev = window.__l67AfterFrame;
+    window.__l67AfterFrame = function () {
+        if (prev) prev();
+        try { glowFrame(); } catch (err) { console.warn('[glow]', err); }
+        try { frame(); }
+        catch (err) {
+            broken = true; console.warn('[performance] turned off after an error:', err);
+            try { restoreAll(); } catch (e2) {}
+            stat.textContent = 'Turned off (error)';
+        }
+    };
+
+    function render() {
+        sw.classList.toggle('on', on); sw.setAttribute('aria-checked', on);
+        if (!on) stat.textContent = 'Off';
+    }
+    sw.addEventListener('click', function () {
+        on = !on; broken = false;
+        try { localStorage.setItem('l67-perf', on ? '1' : '0'); } catch (e) {}
+        if (!on) { try { restoreAll(); } catch (e) {} }
+        render();
+    });
+    render();
+})();
+</script>
+<script>
+// ---- Noclip switch + stats overlay (top left, H to toggle) ----
+(function () {
+    var WAVE_CLASS = 7034460, GM_CLASS = 7027952, PAUSE_CLASS = 7030980, PRACTICE_CLASS = 7031284;
+    var W_DEAD = 0x1C, W_ATTEMPTS = 0xC8, W_FINISH = 0xE0, W_ORIG_START = 0xF8, W_TOTAL = 0x104, W_PLACER = 0x1DC;
+    var F_COMP_TRANSFORM = 0x127A, F_GET_POSITION = 0x127D;
+
+    function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+    function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+
+    // -- switches --
+    var ncSw = document.getElementById('noclip-sw'), stSw = document.getElementById('stats-sw');
+    var box = document.getElementById('stats');
+    function setNoclip(on) {
+        window.__l67Noclip = on; store('l67-noclip', on ? '1' : '0');
+        ncSw.classList.toggle('on', on); ncSw.setAttribute('aria-checked', on);
+        if (on) run.noclipUsed = true;
+    }
+    function setStats(on) {
+        store('l67-stats', on ? '1' : '0');
+        stSw.classList.toggle('on', on); stSw.setAttribute('aria-checked', on);
+        box.classList.toggle('off', !on);
+    }
+    ncSw.addEventListener('click', function () { setNoclip(!window.__l67Noclip); });
+    stSw.addEventListener('click', function () { setStats(box.classList.contains('off')); });
+    window.addEventListener('keydown', function (e) {
+        if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.key === 'h' || e.key === 'H') setStats(box.classList.contains('off'));
+    }, true);
+
+    // -- state --
+    var best = {}; try { best = JSON.parse(load('l67-best') || '{}'); } catch (e) {}
+    var run = { active: false, startPct: 0, maxPct: 0, frames: 0, hitFrames: 0, hits: 0, noclipUsed: false };
+    var dieThisFrame = false, dieLastFrame = false;
+    var g = { inLevel: false, paused: true, pct: 0, attempt: 0, practice: false, key: '', levelTime: 0 };
+    var clicks = 0, clickTimes = [], maxCps = 0, lastT = 0, fns = null, vec = 0, tick = 0;
+    var frameTimes = [], lastFrameAt = 0, lastV = 0;          // real ms between drawn frames, last ~2s
+
+    var realDeathPending = false;
+    window.__l67OnDie = function (skipped) { dieThisFrame = true; if (!skipped) realDeathPending = true; };
+
+    // -- clicks / CPS: the game's jump inputs are Space, Up, W and left mouse --
+    function click() {
+        if (!g.inLevel || g.paused) return;
+        clicks++; clickTimes.push(Date.now());
+    }
+    window.addEventListener('keydown', function (e) {
+        if (!e.repeat && (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW')) click();
+    }, true);
+    window.addEventListener('pointerdown', function (e) {
+        if (e.button === 0 && e.target && e.target.id === 'unity-canvas') click();
+    }, true);
+
+    function ex() { return window.__l67 && window.__l67.exports; }
+    function u8(e) { return new Uint8Array(e.memory.buffer); }
+    function staticByte(e, cls, off) {
+        var u32 = new Uint32Array(e.memory.buffer), c = u32[cls >> 2];
+        var st = c ? u32[(c + 92) >> 2] : 0;
+        return st ? u8(e)[st + off] : 0;
+    }
+
+    // camera centre + visible size in world units (orthographic 2D camera)
+    var camFns = null;
+    function camera(e, wave) {
+        var t = e.__indirect_function_table;
+        if (!camFns) camFns = { ortho: t.get(0x1601), aspect: t.get(0x16C2), tr: t.get(0x127A), pos: t.get(0x127D), main: t.get(0x127F) };
+        var u32 = new Uint32Array(e.memory.buffer);
+        var cam = u32[(wave + 356) >> 2];                         // WaveController.mainCamera
+        if (!cam || u32[(cam + 8) >> 2] === 0) cam = camFns.main(0);
+        if (!cam || new Uint32Array(e.memory.buffer)[(cam + 8) >> 2] === 0) return null;
+        var hh = camFns.ortho(cam, 0), hw = hh * camFns.aspect(cam, 0), tr = camFns.tr(cam, 0);
+        if (!tr) return null;
+        camFns.pos(vec, tr, 0);
+        var f32 = new Float32Array(e.memory.buffer);
+        return { x: f32[vec >> 2], y: f32[(vec + 4) >> 2], hw: hw, hh: hh };
+    }
+
+    function readGame(e) {
+        var wave = window.__l67Wave, u32 = new Uint32Array(e.memory.buffer), f32 = new Float32Array(e.memory.buffer);
+        var inLevel = window.__l67InLevel(e.memory.buffer);
+        var waveOk = wave && u32[(WAVE_CLASS) >> 2] && u32[wave >> 2] === u32[WAVE_CLASS >> 2] && u32[(wave + 8) >> 2] > 0;
+        if (!inLevel || !waveOk) return null;
+        if (!fns) {
+            var t = e.__indirect_function_table;
+            fns = { tr: t.get(F_COMP_TRANSFORM), pos: t.get(F_GET_POSITION) }; vec = e.malloc(16);
+        }
+        var tr = fns.tr(wave, 0);
+        if (!tr || new Uint32Array(e.memory.buffer)[(tr + 8) >> 2] === 0) return null;
+        fns.pos(vec, tr, 0);
+        f32 = new Float32Array(e.memory.buffer); u32 = new Uint32Array(e.memory.buffer);
+        var x = f32[vec >> 2], y = f32[(vec + 4) >> 2], z = f32[(vec + 8) >> 2];
+        var o = (wave + W_ORIG_START) >> 2, total = f32[(wave + W_TOTAL) >> 2], finishX = f32[(wave + W_FINISH) >> 2];
+        // same formula the game uses for its own % counter
+        var pct = 0;
+        if (total > 0) {
+            if (x >= finishX) pct = 100;
+            else {
+                var dx = x - f32[o], dy = y - f32[o + 1], dz = z - f32[o + 2];
+                pct = Math.min(100, Math.sqrt(dx * dx + dy * dy + dz * dz) / total * 100);
+            }
+        }
+        var placer = u32[(wave + W_PLACER) >> 2], list = placer ? u32[(placer + 184) >> 2] : 0;
+        var count = list ? new Int32Array(e.memory.buffer)[(list + 12) >> 2] : 0;
+        return {
+            pct: pct,
+            attempt: new Int32Array(e.memory.buffer)[(wave + W_ATTEMPTS) >> 2] + 1,
+            waiting: staticByte(e, WAVE_CLASS, 4) === 1,
+            finished: staticByte(e, WAVE_CLASS, 5) === 1,
+            dead: u8(e)[wave + W_DEAD] === 1,
+            paused: staticByte(e, PAUSE_CLASS, 4) === 1,
+            practice: staticByte(e, PRACTICE_CLASS, 4) === 1,
+            key: count + '|' + total.toFixed(2),
+            x: x, y: y, cam: camera(e, wave)
+        };
+    }
+
+    function fmtTime(s) { s = Math.floor(s); var m = Math.floor(s / 60); return (m < 10 ? '0' : '') + m + ':' + ('0' + s % 60).slice(-2); }
+    function esc(t) { return String(t).replace(/[&<>]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]; }); }
+    function pad(t, n) { t = String(t); while (t.length < n) t += ' '; return t; }
+
+    function render() {
+        var now = Date.now();
+        while (clickTimes.length && now - clickTimes[0] > 1000) clickTimes.shift();
+        var cps = clickTimes.length; if (cps > maxCps) maxCps = cps;
+        var b = best[g.key] || 0;
+        var lines = [fpsLine()];
+        if (!g.inLevel) {
+            lines.push('<span class="k">Not in a level</span>');
+        } else {
+            if (window.__l67Noclip || run.noclipUsed) {
+                var acc = run.frames ? (1 - run.hitFrames / run.frames) * 100 : 100;
+                lines.push('<span class="nc">' + pad('Noclip ' + acc.toFixed(2) + '%', 18) + run.hits + (run.hits === 1 ? ' death' : ' deaths') + '</span>');
+            }
+            lines.push(pad('Progress ' + Math.floor(g.pct) + '%', 18) + '<span class="k">Best</span> ' + Math.floor(b) + '%');
+            lines.push(pad('Run ' + Math.floor(run.startPct) + '% → ' + Math.floor(run.maxPct) + '%', 18) +
+                       (g.practice ? '<span class="k">Practice</span>' : ''));
+            lines.push(pad('Attempt ' + g.attempt, 18) + '<span class="k">Time</span> ' + fmtTime(g.levelTime));
+            lines.push(pad('Frame ' + run.frames.toLocaleString(), 18) + '<span class="k">this run</span>');
+            lines.push(pad('CPS ' + cps + ' (max ' + maxCps + ')', 18) + '<span class="k">Clicks</span> ' + clicks.toLocaleString());
+        }
+        box.innerHTML = lines.join('\n');
+    }
+
+    function sampleFps() {
+        var t = (window.__l67RealNow || performance.now.bind(performance))();
+        if (lastFrameAt) { frameTimes.push(t - lastFrameAt); if (frameTimes.length > 240) frameTimes.shift(); }
+        lastFrameAt = t;
+    }
+    function fpsLine() {
+        if (frameTimes.length < 5) return 'FPS --';
+        var recent = frameTimes.slice(-30), sum = 0;
+        for (var i = 0; i < recent.length; i++) sum += recent[i];
+        var avgMs = sum / recent.length;
+        // "low" = the worst 5% of frames over the last few seconds, shown as FPS
+        var sorted = frameTimes.slice().sort(function (a, b) { return b - a; });
+        var worst = sorted.slice(0, Math.max(1, Math.floor(sorted.length * 0.05)));
+        var wsum = 0; for (var j = 0; j < worst.length; j++) wsum += worst[j];
+        var low = 1000 / (wsum / worst.length);
+        return pad('FPS ' + Math.round(1000 / avgMs) + '  ' + avgMs.toFixed(1) + 'ms', 18) +
+               '<span class="k">Low</span> ' + Math.round(low);
+    }
+
+    function frame() {
+        sampleFps();
+        var e = ex(), now = performance.now(), real = Date.now();
+        var dtGame = lastV ? Math.min(0.25, (now - lastV) / 1000) : 0; lastV = now;   // game clock (follows speed)
+        var dtReal = lastT ? Math.min(0.25, (real - lastT) / 1000) : 0; lastT = real;
+        var st = e ? readGame(e) : null;
+
+        var wasIn = g.inLevel;
+        g.inLevel = !!st;
+        window.__l67InLevelNow = !!st && !st.paused;
+        if (!st) {
+            if (wasIn) { run.active = false; }
+            dieThisFrame = false;
+        } else {
+            if (st.key !== g.key) {                       // a different level: fresh session numbers
+                g.key = st.key; g.levelTime = 0; clicks = 0; maxCps = 0; clickTimes = [];
+            }
+            g.pct = st.pct; g.attempt = st.attempt; g.practice = st.practice; g.paused = st.paused;
+            if (!st.paused) g.levelTime += dtReal;
+
+            var running = !st.waiting && !st.dead && !st.paused && !st.finished;
+            if (!st.waiting && !st.dead && !run.active && !st.finished) {   // a new run just started
+                run = { active: true, startPct: st.pct, maxPct: st.pct, frames: 0, hitFrames: 0, hits: 0,
+                        noclipUsed: !!window.__l67Noclip };
+            }
+            if (run.active && !run.path) run.path = [];
+            if ((st.waiting || st.dead || st.finished) && run.path) finishPath(st);
+            if (st.waiting || st.dead) run.active = false;
+            if (running && run.path) { run.time = (run.time || 0) + dtGame; recordPath(st); }
+            if (running) {
+                run.frames++;
+                if (dieThisFrame) { run.hitFrames++; if (!dieLastFrame) run.hits++; }
+                if (window.__l67Noclip) run.noclipUsed = true;
+            }
+            if (run.active || st.finished) run.maxPct = Math.max(run.maxPct, st.pct);
+            // best % only counts real runs: no practice, no noclip
+            if ((run.active || st.finished) && !st.practice && !run.noclipUsed && st.pct > (best[g.key] || 0)) {
+                best[g.key] = st.pct; store('l67-best', JSON.stringify(best));
+            }
+            dieLastFrame = dieThisFrame && running;
+            dieThisFrame = false;
+        }
+        if (e) noclipPhysics(e, st);
+        if (st && realDeathPending) {
+            realDeathPending = false;
+            var list = marks[st.key] || (marks[st.key] = []);
+            list.push([Math.round(st.x * 100) / 100, Math.round(st.y * 100) / 100, st.practice ? 1 : 0]);
+            if (list.length > 3000) list.splice(0, list.length - 3000);
+            lastMark = list[list.length - 1]; saveMarks();
+        }
+        realDeathPending = false;
+        if (e) { try { updateHighlight(e); } catch (err) { if (!updateHighlight.warned) { updateHighlight.warned = true; console.warn('[highlight]', err); } } }
+        if (e) { try { updateGhosts(e, st); } catch (err) { if (!updateGhosts.warned) { updateGhosts.warned = true; console.warn('[playback]', err); } } }
+        drawOverlay(st);
+        if (++tick % 6 === 0 && !box.classList.contains('off')) render();
+    }
+
+    // ---- noclip physics ----
+    // The wave is a dynamic Rigidbody2D, so solid blocks physically push it back even when it can't die.
+    // With noclip on, the wave (and the dual clone) become Kinematic with full kinematic contacts: nothing
+    // can push them, but collision and trigger events still fire. That keeps portals, orbs, coins, speed
+    // changes and, importantly, the finish line working, while hazards only count as noclip hits.
+    var KINEMATIC = 1, DYNAMIC = 0, W_RB = 0x18, W_CLONE = 460, C_RB = 0x18;
+    var FLOOR_BAND = 0.157, WAVE_HALF = 0.05;     // floor/ceiling line and wave half-size, as shares of the camera half-height
+    var physFns = null, weChanged = new Set(), finishedCalled = false;
+    function noclipPhysics(e, st) {
+        var t = e.__indirect_function_table;
+        if (!physFns) physFns = { getType: t.get(0x61C1), setType: t.get(0x61C2), fullContacts: t.get(0x61C3), onFinish: t.get(0x3C43),
+                                  tr: t.get(0x127A), getPos: t.get(0x127D), setPos: t.get(0x1E97), buf: e.malloc(16) };
+        var wave = window.__l67Wave;
+        var u32 = new Uint32Array(e.memory.buffer);
+        var alive = function (o) { return o && new Uint32Array(e.memory.buffer)[(o + 8) >> 2] > 0; };
+        var rbs = [];
+        if (st && wave) {
+            rbs.push(u32[(wave + W_RB) >> 2]);
+            var clone = u32[(wave + W_CLONE) >> 2];
+            if (alive(clone)) rbs.push(new Uint32Array(e.memory.buffer)[(clone + C_RB) >> 2]);
+        }
+        var want = !!window.__l67Noclip && !!st;
+        rbs.forEach(function (rb) {
+            if (!alive(rb)) return;
+            if (want) {
+                if (physFns.getType(rb, 0) !== KINEMATIC) { physFns.setType(rb, KINEMATIC, 0); physFns.fullContacts(rb, 1, 0); weChanged.add(rb); }
+            }
+        });
+        if (!want && weChanged.size) {
+            weChanged.forEach(function (rb) {
+                if (alive(rb) && physFns.getType(rb, 0) === KINEMATIC) { physFns.setType(rb, DYNAMIC, 0); physFns.fullContacts(rb, 0, 0); }
+            });
+            weChanged.clear();
+        }
+        // keep the wave inside the playfield: with hitboxes off, the floor and ceiling blocks no
+        // longer stop it. In this game the floor and ceiling sit at a fixed spot on screen (the bands
+        // at the top and bottom, ~15.7% of the half-height each), so clamp the wave's centre to just
+        // inside those lines.
+        if (want && st.cam && !st.waiting && !st.dead) {
+            var edge = st.cam.hh * (1 - FLOOR_BAND - WAVE_HALF);
+            var lo = st.cam.y - edge, hi = st.cam.y + edge;
+            var targets = [wave];
+            var cl = new Uint32Array(e.memory.buffer)[(wave + W_CLONE) >> 2];
+            if (alive(cl)) targets.push(cl);
+            targets.forEach(function (obj) {
+                var tr = physFns.tr(obj, 0);
+                if (!alive(tr)) return;
+                physFns.getPos(physFns.buf, tr, 0);
+                var f = new Float32Array(e.memory.buffer), i = physFns.buf >> 2, y = f[i + 1];
+                if (y < lo || y > hi) { f[i + 1] = Math.min(hi, Math.max(lo, y)); physFns.setPos(tr, physFns.buf, 0); }
+            });
+        }
+        // safety net: never fly past the finish line in noclip
+        if (!st || st.waiting) { finishedCalled = false; return; }
+        if (want && !st.finished && !finishedCalled && wave) {
+            var finishX = new Float32Array(e.memory.buffer)[(wave + 0xE0) >> 2];
+            if (finishX > 0 && st.x >= finishX + 0.5) { finishedCalled = true; physFns.onFinish(wave, 0); }
+        }
+    }
+
+    // ---- death markers: every real death is saved per level and drawn where it happened ----
+    var marks = {}; try { marks = JSON.parse(load('l67-marks') || '{}'); } catch (e) {}
+    var lastMark = null, saveTimer = 0;
+    var mcv = document.getElementById('death-marks'), mctx = mcv.getContext('2d');
+    var mSw = document.getElementById('marks-sw'), mStat = document.getElementById('marks-stat');
+    var marksOn = load('l67-marks-on') !== '0';
+    function saveMarks() { clearTimeout(saveTimer); saveTimer = setTimeout(function () { store('l67-marks', JSON.stringify(marks)); }, 500); }
+    function setMarks(on) {
+        marksOn = on; store('l67-marks-on', on ? '1' : '0');
+        mSw.classList.toggle('on', on); mSw.setAttribute('aria-checked', on);
+        if (!on) mcv.style.display = 'none';
+    }
+    mSw.addEventListener('click', function () { setMarks(!marksOn); });
+    document.getElementById('marks-clear').addEventListener('click', function () {
+        if (g.key && marks[g.key]) { delete marks[g.key]; lastMark = null; saveMarks(); }
+    });
+    window.addEventListener('keydown', function (e) {
+        if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.key === 'm' || e.key === 'M') setMarks(!marksOn);
+    }, true);
+
+    function drawX(c, x, y, r, color, alpha) {
+        c.globalAlpha = alpha;
+        c.lineCap = 'round';
+        c.strokeStyle = 'rgba(0,0,0,.65)'; c.lineWidth = r * 0.75;
+        c.beginPath(); c.moveTo(x - r, y - r); c.lineTo(x + r, y + r); c.moveTo(x + r, y - r); c.lineTo(x - r, y + r); c.stroke();
+        c.strokeStyle = color; c.lineWidth = r * 0.4;
+        c.beginPath(); c.moveTo(x - r, y - r); c.lineTo(x + r, y + r); c.moveTo(x + r, y - r); c.lineTo(x - r, y + r); c.stroke();
+    }
+    // ---- all attempts: every run's path this session, drawn faintly on top of the level ----
+    var paths = {}, pathsOn = load('l67-paths-on') === '1';
+    var pSw = document.getElementById('paths-sw');
+    function setPaths(on) {
+        pathsOn = on; store('l67-paths-on', on ? '1' : '0');
+        pSw.classList.toggle('on', on); pSw.setAttribute('aria-checked', on);
+    }
+    pSw.addEventListener('click', function () { setPaths(!pathsOn); });
+    window.addEventListener('keydown', function (e) {
+        if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.key === 't' || e.key === 'T') setPaths(!pathsOn);
+    }, true);
+    // Attempt playback. Every attempt is recorded as (x, y, skin angle, skin scale) per frame. During a run,
+    // each old attempt becomes a real in-game copy of your wave: the game's own WaveSkin and Trail objects
+    // are cloned with Object.Instantiate, so ghosts use your exact skin, colours and trails, and the trails
+    // fade over the same 3 seconds as yours. Ghosts are synced to your x position, so they move exactly
+    // with you (every attempt moves right at the same speed), each at the height it was on that attempt.
+    var GF = null, ghostPool = [], ghostsShown = false, gbuf = 0;
+    function gfns(e) {
+        if (GF) return GF;
+        var t = e.__indirect_function_table;
+        GF = { inst: t.get(0x5011), goTr: t.get(0x1E83), compTr: t.get(0x127A), compGo: t.get(0xD78),
+               setActive: t.get(0xD57), setPos: t.get(0x1E97), getPos: t.get(0x127D),
+               getEuler: t.get(0x5130), setEuler: t.get(0x5131), setScale: t.get(0x1E84), lossy: t.get(0x514D),
+               sw: t.get(0x496C), ew: t.get(0x496E), setSW: t.get(0x496D), setEW: t.get(0x496F),
+               setSC: t.get(0x4970), setEC: t.get(0x4971), clear: t.get(0x4972) };
+        gbuf = e.malloc(32);
+        return GF;
+    }
+    function F32(e) { return new Float32Array(e.memory.buffer); }
+    function okObj(e, o) { return o && new Uint32Array(e.memory.buffer)[(o + 8) >> 2] > 0; }
+    function vec3(e, x, y, z) { var f = F32(e), i = gbuf >> 2; f[i] = x; f[i + 1] = y; f[i + 2] = z; return gbuf; }
+
+    function playerSkin(e, wave) {               // current skin transform: angle + world scale
+        var G = gfns(e), go = new Uint32Array(e.memory.buffer)[(wave + 376) >> 2];
+        if (!okObj(e, go)) return null;
+        var tr = G.goTr(go, 0); if (!okObj(e, tr)) return null;
+        G.getEuler(gbuf, tr, 0); var ang = F32(e)[(gbuf >> 2) + 2];
+        G.lossy(gbuf, tr, 0); var sc = F32(e)[gbuf >> 2];
+        return { ang: ang, sc: sc };
+    }
+    // ---- highlight: tint your own wave's skin so it stands out from the ghosts ----
+    // WaveSkinController.GetSkinComponents() gives the skin's SpriteRenderers; the WaveSkin object's own
+    // SpriteRenderer is found with GameObject.GetComponent(type of one of those). Original colours are
+    // remembered and put back when you turn it off, and ghosts are always cloned from the untinted look.
+    var HL = [1, 0.82, 0.18, 1], hlOn = load('l67-hl') === '1', hlOrig = new Map(), hlList = [], hlWave = 0, hlTick = 0;
+    var hlSw = document.getElementById('hl-sw');
+    function setHl(on) {
+        hlOn = on; store('l67-hl', on ? '1' : '0');
+        hlSw.classList.toggle('on', on); hlSw.setAttribute('aria-checked', on);
+        if (!on) { var e = ex(); if (e) unTint(e); }
+    }
+    hlSw.addEventListener('click', function () { setHl(!hlOn); });
+    function hlRenderers(e, wave) {
+        var t = e.__indirect_function_table, u32 = new Uint32Array(e.memory.buffer), out = [];
+        // 1) the main icon: the game itself does GetComponent<SpriteRenderer>() on WaveSkin when it loads your
+        //    wave colour (WaveController.LoadWaveColors); we make the exact same call with the same method info
+        var skinGo = u32[(wave + 376) >> 2], mi = u32[7081036 >> 2];
+        if (okObj(e, skinGo) && mi) {
+            var own = t.get(0x1997)(skinGo, mi);
+            if (okObj(e, own)) out.push(own);
+        }
+        // 2) extra parts of the selected skin, if the skin system is in use
+        u32 = new Uint32Array(e.memory.buffer);
+        var ctrl = u32[(wave + 384) >> 2];
+        if (okObj(e, ctrl)) {
+            var arr = t.get(0x3CDA)(ctrl, 0);                       // WaveSkinController.GetSkinComponents()
+            u32 = new Uint32Array(e.memory.buffer);
+            if (arr) { var n = u32[(arr + 12) >> 2]; for (var i = 0; i < n && i < 64; i++) { var sr = u32[(arr + 16 + i * 4) >> 2]; if (okObj(e, sr) && out.indexOf(sr) < 0) out.push(sr); } }
+        }
+        if (!hlRenderers.logged || hlRenderers.logged !== out.length) {
+            hlRenderers.logged = out.length; console.log('[highlight] tinting ' + out.length + ' part(s) of your wave');
+        }
+        return out;
+    }
+    function getColor(e, sr) { e.__indirect_function_table.get(0x1E67)(gbuf, sr, 0); var f = F32(e), i = gbuf >> 2; return [f[i], f[i + 1], f[i + 2], f[i + 3]]; }
+    function setColor(e, sr, c) { var f = F32(e), i = gbuf >> 2; f[i] = c[0]; f[i + 1] = c[1]; f[i + 2] = c[2]; f[i + 3] = c[3]; e.__indirect_function_table.get(0x1E64)(sr, gbuf, 0); }
+    function same(a, b) { return Math.abs(a[0] - b[0]) < 0.01 && Math.abs(a[1] - b[1]) < 0.01 && Math.abs(a[2] - b[2]) < 0.01; }
+    function tint(e) {
+        hlList.forEach(function (sr) {
+            if (!okObj(e, sr)) return;
+            var c = getColor(e, sr);
+            if (!same(c, HL)) { hlOrig.set(sr, c); setColor(e, sr, [HL[0], HL[1], HL[2], c[3]]); }
+        });
+    }
+    function unTint(e) {
+        hlOrig.forEach(function (c, sr) { if (okObj(e, sr)) setColor(e, sr, c); });
+        hlOrig.clear();
+    }
+    function updateHighlight(e) {
+        var wave = window.__l67Wave;
+        if (!hlOn || !wave) return;
+        gfns(e);
+        if (wave !== hlWave || hlTick % (hlList.length ? 120 : 30) === 0) { hlList = hlRenderers(e, wave); hlWave = wave; }
+        hlTick++; tint(e);                                           // every frame: cheap, and survives any recolour
+    }
+
+    function makeGhost(e, wave) {
+        var tinted = hlOrig.size > 0;
+        if (tinted) unTint(e);                                       // ghosts copy your normal colours
+        try { return makeGhostRaw(e, wave); } finally { if (tinted) tint(e); }
+    }
+    function makeGhostRaw(e, wave) {
+        var G = gfns(e), u32 = new Uint32Array(e.memory.buffer);
+        var skinGo = u32[(wave + 376) >> 2], trMain = u32[(wave + 32) >> 2], tr2 = u32[(wave + 36) >> 2];
+        if (!okObj(e, skinGo) || !okObj(e, tr2)) return null;
+        var gh = { skin: G.inst(skinGo, 0), a: G.inst(tr2, 0), b: G.inst(tr2, 0), on: true };
+        gh.skinTr = G.goTr(gh.skin, 0);
+        gh.aTr = G.compTr(gh.a, 0); gh.aGo = G.compGo(gh.a, 0);
+        gh.bTr = G.compTr(gh.b, 0); gh.bGo = G.compGo(gh.b, 0);
+        // trail "a" stands in for your main trail (which lives on the wave itself and can't be cloned alone)
+        if (okObj(e, trMain)) { G.setSW(gh.a, G.sw(trMain, 0), 0); G.setEW(gh.a, G.ew(trMain, 0), 0); }
+        var f = F32(e), i = gbuf >> 2; f[i] = 1; f[i + 1] = 1; f[i + 2] = 1; f[i + 3] = 1;
+        G.setSC(gh.a, gbuf, 0); f[i + 3] = 0; G.setEC(gh.a, gbuf, 0);
+        return gh;
+    }
+    function ghostOk(e, gh) { return gh && okObj(e, gh.skin) && okObj(e, gh.aGo) && okObj(e, gh.bGo); }
+    function showGhost(e, gh, on) {
+        if (gh.on === on) return;
+        var G = gfns(e);
+        G.setActive(gh.skin, on ? 1 : 0, 0); G.setActive(gh.aGo, on ? 1 : 0, 0); G.setActive(gh.bGo, on ? 1 : 0, 0);
+        gh.on = on; gh.fresh = on;
+    }
+    function hideAllGhosts(e) {
+        if (!ghostsShown) return;
+        ghostPool.forEach(function (gh) { if (ghostOk(e, gh)) showGhost(e, gh, false); });
+        ghostsShown = false;
+    }
+    function placeGhost(e, gh, x, y, ang, sc) {
+        var G = gfns(e);
+        G.setPos(gh.skinTr, vec3(e, x, y, 0), 0);
+        G.setEuler(gh.skinTr, vec3(e, 0, 0, ang), 0);
+        G.setScale(gh.skinTr, vec3(e, sc, sc, 1), 0);
+        G.setPos(gh.aTr, vec3(e, x, y, 0), 0);
+        G.setPos(gh.bTr, vec3(e, x, y, 0), 0);
+        if (gh.fresh) { G.clear(gh.a, 0); G.clear(gh.b, 0); gh.fresh = false; }   // no streak from its old spot
+    }
+
+    function recordPath(st) {
+        var p = run.path;
+        if (p.length >= 4 * 20000) return;
+        var e = ex(), sk = e && window.__l67Wave ? playerSkin(e, window.__l67Wave) : null;
+        p.push(st.x, st.y, sk ? sk.ang : 0, sk ? sk.sc : 0.25);
+    }
+    function finishPath(st) {
+        var p = run.path; run.path = null;
+        if (!p || p.length < 12) return;
+        var list = paths[g.key] || (paths[g.key] = []);
+        list.push({ pts: new Float32Array(p), endX: p[p.length - 4], died: !!st.dead, noclip: run.noclipUsed });
+        if (list.length > 150) list.shift();
+    }
+    function idxAtX(pts, x) {                     // fractional sample index where the attempt was at x
+        var n = pts.length / 4, lo = 0, hi = n - 1;
+        if (x <= pts[0]) return 0;
+        if (x >= pts[(n - 1) * 4]) return n - 1;
+        while (hi - lo > 1) { var m = (lo + hi) >> 1; if (pts[m * 4] <= x) lo = m; else hi = m; }
+        return lo + (x - pts[lo * 4]) / Math.max(1e-6, pts[hi * 4] - pts[lo * 4]);
+    }
+    function val(pts, f, k) { var i = Math.floor(f), j = Math.min(i + 1, pts.length / 4 - 1), u = f - i; return pts[i * 4 + k] * (1 - u) + pts[j * 4 + k] * u; }
+
+    function updateGhosts(e, st) {
+        var list = st && paths[st.key];
+        if (!pathsOn || !st || !run.active || !list || !list.length) { hideAllGhosts(e); return; }
+        var wave = window.__l67Wave, MAX = 100;
+        var use = list.slice(-MAX);
+        while (ghostPool.length < use.length) {
+            var gh = makeGhost(e, wave); if (!gh) return;
+            showGhost(e, gh, false); ghostPool.push(gh);
+        }
+        for (var i = 0; i < ghostPool.length; i++) {
+            var gh2 = ghostPool[i];
+            if (!ghostOk(e, gh2)) { ghostPool[i] = gh2 = makeGhost(e, wave); if (!gh2) continue; showGhost(e, gh2, false); }
+            var a = use[i];
+            if (!a) { showGhost(e, gh2, false); continue; }
+            var pts = a.pts, n = pts.length / 4, x = st.x;
+            if (x < pts[0] || x > a.endX) { showGhost(e, gh2, false); continue; }
+            var f = idxAtX(pts, x);
+            showGhost(e, gh2, true);
+            var ang = pts[Math.round(f) * 4 + 2];                 // angles snap, don't interpolate 350 -> 10
+            placeGhost(e, gh2, x, val(pts, f, 1), ang, pts[Math.round(f) * 4 + 3] || 0.25);
+        }
+        ghostsShown = true;
+    }
+
+    // only a small "pop" ring is drawn by the page, where a ghost's attempt died
+    function drawPaths(c, W, H, st) {
+        var list = paths[st.key];
+        if (!list || !run.active) return;
+        var unit = H / (2 * c.hh);
+        list.slice(-100).forEach(function (a) {
+            if (!a.died) return;
+            var d = st.x - a.endX; if (d < 0 || d > 1.2) return;
+            var pts = a.pts, n = pts.length / 4, k = d / 1.2;
+            var px = (pts[(n - 1) * 4] - c.x) / (2 * c.hw) * W + W / 2;
+            var py = H / 2 - (pts[(n - 1) * 4 + 1] - c.y) / (2 * c.hh) * H;
+            mctx.globalAlpha = 0.7 * (1 - k);
+            mctx.strokeStyle = '#ffffff'; mctx.lineWidth = Math.max(1.5, unit * 0.06);
+            mctx.beginPath(); mctx.arc(px, py, unit * (0.2 + k * 0.6), 0, Math.PI * 2); mctx.stroke();
+        });
+        mctx.globalAlpha = 1;
+    }
+
+    function drawOverlay(st) {
+        var list = st ? marks[st.key] : null;
+        if (tick % 15 === 0) mStat.textContent = st ? ((list ? list.length : 0) + ' deaths saved here') : '—';
+        var hold = document.getElementById('frame-hold');
+        var showMarks = marksOn && list && list.length, showPaths = pathsOn && paths[st && st.key] && paths[st.key].length;
+        if (!st || !st.cam || !(showMarks || showPaths) || (hold && hold.style.display === 'block')) {
+            mcv.style.display = 'none'; return;
+        }
+        var glc = document.getElementById('unity-canvas'), r = glc.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+        var W = Math.round(r.width * dpr), H = Math.round(r.height * dpr);
+        if (mcv.width !== W || mcv.height !== H) { mcv.width = W; mcv.height = H; }
+        mcv.style.left = r.left + 'px'; mcv.style.top = r.top + 'px';
+        mcv.style.width = r.width + 'px'; mcv.style.height = r.height + 'px';
+        mcv.style.display = 'block';
+        mctx.clearRect(0, 0, W, H);
+        var c = st.cam, size = Math.max(4, H / 110);
+        if (showPaths) drawPaths(c, W, H, st);
+        if (!showMarks) return;
+        var left = c.x - c.hw - 1, right = c.x + c.hw + 1;
+        for (var i = 0; i < list.length; i++) {
+            var p = list[i];
+            if (p[0] < left || p[0] > right) continue;
+            var sx = (p[0] - c.x) / (2 * c.hw) * W + W / 2;
+            var sy = H / 2 - (p[1] - c.y) / (2 * c.hh) * H;
+            var latest = p === lastMark;
+            drawX(mctx, sx, sy, latest ? size * 1.3 : size, latest ? '#ffffff' : (p[2] ? '#ffb347' : '#ff4d4d'), latest ? 1 : 0.75);
+        }
+        mctx.globalAlpha = 1;
+    }
+
+    var prev = window.__l67AfterFrame;
+    window.__l67AfterFrame = function () {
+        if (prev) prev();
+        try { frame(); } catch (err) { if (!frame.warned) { frame.warned = true; console.warn('[stats]', err); } }
+    };
+    setMarks(marksOn);
+    setPaths(pathsOn);
+    setHl(hlOn);
+
+    var cbfSw = document.getElementById('cbf-sw');
+    function setCbf(on) {
+        window.__l67Cbf = on; store('l67-cbf', on ? '1' : '0');
+        cbfSw.classList.toggle('on', on); cbfSw.setAttribute('aria-checked', on);
+    }
+    cbfSw.addEventListener('click', function () { setCbf(!window.__l67Cbf); });
+    setCbf(load('l67-cbf') === '1');
+
+    setNoclip(load('l67-noclip') === '1');
+    setStats(load('l67-stats') !== '0');
+    render();
+})();
+</script>
+</body>
+</html>
